@@ -1365,21 +1365,22 @@ def main():
                 st.markdown(f"**{sidebar_cfg.custom_label}**")
                 st.markdown("---")
             if sidebar_cfg.show_nav:
+                # key = query param value, flag = registry key to check
                 nav_items = [
-                    ("🏠 Dashboard",         "dashboard"),
-                    ("📦 Inventory",         "inventory"),
-                    ("📥 Import",            "import"),
-                    ("📋 Count Import",      "count_import"),
-                    ("🏷️  GL Codes",          "gl_codes"),
-                    ("📜 History",           "history"),
-                    ("📤 Export",            "export"),
-                    ("⚙️  Settings",          "settings"),
+                    ("🏠 Dashboard",     "dashboard",    "dashboard"),
+                    ("📦 Inventory",     "inventory",    "inventory"),
+                    ("📥 Import",        "import",       "vendor_import"),
+                    ("📋 Count Import",  "count_import", "count_import"),
+                    ("🏷️  GL Codes",      "gl_codes",     "gl_codes"),
+                    ("📜 History",       "history",      "history"),
+                    ("📤 Export",        "export",       "export"),
+                    ("⚙️  Settings",      "settings",     "settings"),
                 ]
-                for label, key in nav_items:
-                    if reg.is_enabled(key.replace("_", "").replace(" ", "")):
-                        if st.button(label, key=f"nav_{key}",
+                for label, page_key, flag_key in nav_items:
+                    if reg.is_enabled(flag_key):
+                        if st.button(label, key=f"nav_{page_key}",
                                      use_container_width=True):
-                            st.query_params["page"] = key
+                            st.query_params["page"] = page_key
                             st.rerun()
 
     onedrive_auth_sidebar()

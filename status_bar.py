@@ -22,14 +22,23 @@ import streamlit as st
 
 _TOPNAV_CSS = """
 <style>
-/* ── Push Streamlit content down so it clears the nav bar ────────────────── */
-.stApp > header { display: none !important; }
+/* ── Streamlit header hide — multi-version selectors ─────────────────────── */
+header[data-testid="stHeader"],
+.stApp > header,
+#stHeader,
+div[data-testid="stToolbar"] {
+  display: none !important;
+  height:  0    !important;
+}
+
+/* ── Push content down to clear our nav bar ──────────────────────────────── */
 .main .block-container {
   padding-top:    54px  !important;
   padding-bottom: 50px  !important;
 }
 section[data-testid="stSidebar"] > div:first-child {
   padding-top: 54px !important;
+  margin-top:  0    !important;
 }
 
 /* ── Fixed top nav bar ────────────────────────────────────────────────────── */
@@ -39,7 +48,7 @@ section[data-testid="stSidebar"] > div:first-child {
   left:        0;
   right:       0;
   height:      42px;
-  z-index:     99999;
+  z-index:     999999;
   background:  #0e1117;
   border-bottom: 1px solid #1e2530;
   display:     flex;
@@ -49,9 +58,10 @@ section[data-testid="stSidebar"] > div:first-child {
   font-family: 'Segoe UI', sans-serif;
   font-size:   13px;
   user-select: none;
+  box-shadow:  0 2px 8px rgba(0,0,0,0.4);
 }
 
-/* ── App title / logo ─────────────────────────────────────────────────────── */
+/* ── App brand ────────────────────────────────────────────────────────────── */
 #uha-topnav .uha-brand {
   color:        #5ab4e4;
   font-weight:  700;
@@ -67,15 +77,15 @@ section[data-testid="stSidebar"] > div:first-child {
   display:    inline-block;
 }
 .uha-menu-btn {
-  background:  transparent;
-  border:      none;
-  color:       #8ab4d4;
-  padding:     6px 10px;
-  cursor:      pointer;
+  background:   transparent;
+  border:       none;
+  color:        #8ab4d4;
+  padding:      6px 10px;
+  cursor:       pointer;
   border-radius: 4px;
-  font-size:   13px;
-  font-family: inherit;
-  transition:  background 0.15s, color 0.15s;
+  font-size:    13px;
+  font-family:  inherit;
+  transition:   background 0.15s, color 0.15s;
 }
 .uha-menu-btn:hover,
 .uha-menu:hover .uha-menu-btn {
@@ -94,12 +104,10 @@ section[data-testid="stSidebar"] > div:first-child {
   border:        1px solid #2a3a4a;
   border-radius: 4px;
   box-shadow:    0 4px 16px rgba(0,0,0,0.5);
-  z-index:       100000;
+  z-index:       1000000;
   padding:       4px 0;
 }
-.uha-menu:hover .uha-dropdown {
-  display: block;
-}
+.uha-menu:hover .uha-dropdown { display: block; }
 
 /* ── Dropdown items ───────────────────────────────────────────────────────── */
 .uha-item {
@@ -112,10 +120,7 @@ section[data-testid="stSidebar"] > div:first-child {
   text-decoration: none;
   transition:  background 0.1s;
 }
-.uha-item:hover {
-  background: #1e2a3a;
-  color:      #e0f0ff;
-}
+.uha-item:hover { background: #1e2a3a; color: #e0f0ff; }
 
 /* ── Disabled items ───────────────────────────────────────────────────────── */
 .uha-item.uha-disabled {
@@ -123,18 +128,12 @@ section[data-testid="stSidebar"] > div:first-child {
   cursor:         default;
   pointer-events: none;
 }
-.uha-item.uha-disabled:hover {
-  background: transparent;
-}
+.uha-item.uha-disabled:hover { background: transparent; }
 
 /* ── Separator ────────────────────────────────────────────────────────────── */
-.uha-sep {
-  height:      1px;
-  background:  #1e2a3a;
-  margin:      4px 0;
-}
+.uha-sep { height: 1px; background: #1e2a3a; margin: 4px 0; }
 
-/* ── Right-side controls (sidebar toggle, etc.) ───────────────────────────── */
+/* ── Right-side controls ──────────────────────────────────────────────────── */
 #uha-topnav .uha-right {
   margin-left: auto;
   display:     flex;
@@ -142,33 +141,48 @@ section[data-testid="stSidebar"] > div:first-child {
   gap:         8px;
 }
 .uha-icon-btn {
-  background:  transparent;
-  border:      none;
-  color:       #5a7a9a;
-  font-size:   15px;
-  cursor:      pointer;
-  padding:     4px 7px;
+  background:   transparent;
+  border:       none;
+  color:        #5a7a9a;
+  font-size:    15px;
+  cursor:       pointer;
+  padding:      4px 7px;
   border-radius: 4px;
-  transition:  background 0.15s, color 0.15s;
+  transition:   background 0.15s, color 0.15s;
 }
-.uha-icon-btn:hover {
-  background: #1e2a3a;
-  color:      #8ab4d4;
-}
-.uha-icon-btn.uha-active {
-  color:      #5ab4e4;
-  background: #1a2a3a;
-}
+.uha-icon-btn:hover    { background: #1e2a3a; color: #8ab4d4; }
+.uha-icon-btn.uha-active { color: #5ab4e4; background: #1a2a3a; }
 
 /* ── Sidebar hide/show ────────────────────────────────────────────────────── */
 body.uha-sidebar-hidden section[data-testid="stSidebar"] {
   display: none !important;
 }
 body.uha-sidebar-hidden .main .block-container {
-  max-width: 100% !important;
-  padding-left: 2rem !important;
+  max-width:    100%   !important;
+  padding-left: 2rem   !important;
 }
 </style>
+
+<script>
+/* Move #uha-topnav to document.body so it's never clipped by Streamlit's
+   iframe / stApp container z-index stacking context.               */
+(function() {
+  function moveNav() {
+    var nav = document.getElementById('uha-topnav');
+    if (nav && nav.parentElement !== document.body) {
+      document.body.appendChild(nav);
+    }
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', moveNav);
+  } else {
+    moveNav();
+  }
+  /* Re-run after Streamlit rerenders */
+  var obs = new MutationObserver(moveNav);
+  obs.observe(document.body, { childList: true, subtree: false });
+})();
+</script>
 """
 
 # ── end of top nav CSS ────────────────────────────────────────────────────────
