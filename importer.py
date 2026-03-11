@@ -11,6 +11,20 @@ from datetime import datetime
 
 
 # -----------------------------------------------------------------------
+# SCALAR HELPER — prevents "truth value of Series is ambiguous" errors
+# -----------------------------------------------------------------------
+def _scalar(val):
+    """Always return a plain scalar, never a Series."""
+    if isinstance(val, pd.Series):
+        val = val.iloc[0] if not val.empty else None
+    if val is None:
+        return None
+    if isinstance(val, float) and pd.isna(val):
+        return None
+    return val
+
+
+# -----------------------------------------------------------------------
 # NORMALIZERS  (from Production Power Query)
 # -----------------------------------------------------------------------
 SKIP_PHRASES = [
@@ -27,15 +41,17 @@ PACK_NORM = {
 
 def normalize_pack_type(raw: str) -> str:
     """fxNormalizePackType — matches production Power Query logic."""
-    if not raw or pd.isna(raw):
+    if raw is None:
         return 'CASE'
+    try:
+        if pd.isna(raw):
+            return 'CASE'
+    except (TypeError, ValueError):
+        pass
     s = str(raw).strip().upper()
-    # Keep only valid chars
     s = re.sub(r'[^A-Z0-9/\s\-X.]', '', s)
-    # Replace /EACH and /1 endings
     s = re.sub(r'/EACH$', '/EA', s)
     s = re.sub(r'/1$', '/EA', s)
-    # Normalise suffix tokens
     parts = re.split(r'([^A-Z0-9])', s)
     normed = []
     for p in parts:
@@ -55,7 +71,10 @@ def build_key(item_name: str, pack_type: str) -> Optional[str]:
 
 def clean_price(value) -> Optional[float]:
     """Strip $, commas, whitespace; return float or None."""
-    if value is None or (isinstance(value, float) and pd.isna(value)):
+    value = _scalar(value)
+    if value is None:
+        return None
+    if isinstance(value, float) and pd.isna(value):
         return None
     s = re.sub(r'[$,\s]', '', str(value))
     try:
@@ -69,8 +88,13 @@ def split_gl_field(gl_string: str) -> Tuple[str, str]:
     'Produce 411085' -> ('Produce', '411085')
     '411085'         -> ('', '411085')
     """
-    if not gl_string or pd.isna(gl_string):
+    if not gl_string:
         return ('', '')
+    try:
+        if pd.isna(gl_string):
+            return ('', '')
+    except (TypeError, ValueError):
+        pass
     s = str(gl_string).strip()
     m = re.search(r'^(.*?)\s*(\d{6})\s*$', s)
     if m:
@@ -139,7 +163,10 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
         key = str(col).strip().upper()
         if key in COL_MAP:
             rename[col] = COL_MAP[key]
-    return df.rename(columns=rename)
+    df = df.rename(columns=rename)
+    # Drop duplicate columns after renaming, keeping first occurrence
+    df = df.loc[:, ~df.columns.duplicated()]
+    return df
 
 
 # -----------------------------------------------------------------------
@@ -190,19 +217,19 @@ class InventoryImporter:
                 continue
 
             # Skip B2 substitution rows
-            status = str(row.get('status') or '').upper()
-            pack   = str(row.get('pack_type') or '')
+            status = str(_scalar(row.get('status')) or '').upper()
+            pack   = str(_scalar(row.get('pack_type')) or '')
             if 'SUBSTITUTION' in status or pack.strip() == '99':
                 analysis['skipped'].append(idx)
                 continue
 
-            description = row.get('description')
+            description = _scalar(row.get('description'))
             if not description:
                 continue
 
-            pack_raw = row.get('pack_type') or ''
+            pack_raw  = _scalar(row.get('pack_type')) or ''
             pack_norm = normalize_pack_type(pack_raw)
-            key = build_key(description, pack_norm)
+            key       = build_key(description, pack_norm)
             if not key:
                 analysis['errors'].append(f"Row {idx+1}: Could not build key")
                 continue
@@ -270,8 +297,8 @@ class InventoryImporter:
         analysis = self.analyze_import(df)
         if auto_approve:
             from pathlib import Path
-            doc_date  = datetime.now().strftime('%Y-%m-%d')
-            results   = self.execute_import(
+            doc_date = datetime.now().strftime('%Y-%m-%d')
+            results  = self.execute_import(
                 analysis,
                 changed_by=changed_by,
                 source_document=Path(filepath).name,
@@ -284,27 +311,21 @@ class InventoryImporter:
     def _prepare_row(self, row, key: str, pack_norm: str) -> Dict:
         item = {
             'key':         key,
-            'description': str(row.get('description') or '').strip().upper(),
+            'description': str(_scalar(row.get('description')) or '').strip().upper(),
             'pack_type':   pack_norm,
         }
 
-        cost = clean_price(row.get('cost'))
+        cost = clean_price(_scalar(row.get('cost')))
         if cost is not None:
             item['cost'] = cost
 
-        if row.get('vendor'):
-            item['vendor'] = str(row['vendor']).strip()
-        if row.get('item_number'):
-            item['item_number'] = str(row['item_number']).strip()
-        if row.get('mog'):
-            item['mog'] = str(row['mog']).strip()
-        if row.get('brand'):
-            item['brand'] = str(row['brand']).strip()
-        if row.get('gtin'):
-            item['gtin'] = str(row['gtin']).strip()
+        for field in ('vendor', 'item_number', 'mog', 'brand', 'gtin'):
+            val = _scalar(row.get(field))
+            if val:
+                item[field] = str(val).strip()
 
         # GL field — may be "Produce 411085" combined
-        gl_raw = row.get('gl_field') or row.get('gl_code') or ''
+        gl_raw = _scalar(row.get('gl_field')) or _scalar(row.get('gl_code')) or ''
         if gl_raw:
             gl_name, gl_code = split_gl_field(str(gl_raw))
             if gl_code:
@@ -313,7 +334,7 @@ class InventoryImporter:
             elif gl_name:
                 item['gl_code'] = gl_name  # bare code stored as-is
 
-        qty = row.get('quantity')
+        qty = _scalar(row.get('quantity'))
         if qty is not None:
             try:
                 item['quantity_on_hand'] = float(re.sub(r'[^\d.]', '', str(qty)))
