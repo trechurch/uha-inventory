@@ -273,8 +273,8 @@ def _edit_item_form(db, item: dict):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _ck(filename: str, item_key: str) -> str:
-    """Unique key for an item inside import_selections dict."""
-    return f"{filename}||{item_key}"
+    """Flat session_state key for an individual item checkbox."""
+    return f"sel||{filename}||{item_key}"
 
 
 def _all_items_for_file(d: dict) -> list:
@@ -283,9 +283,12 @@ def _all_items_for_file(d: dict) -> list:
     return d["analysis"]["new_items"] + d["analysis"]["updates"]
 
 
-def _sel() -> dict:
-    """Shortcut to the single source-of-truth selections dict."""
-    return st.session_state.setdefault("import_selections", {})
+def _get_sel(filename: str, item_key: str) -> bool:
+    return st.session_state.get(_ck(filename, item_key), True)
+
+
+def _set_sel(filename: str, item_key: str, value: bool):
+    st.session_state[_ck(filename, item_key)] = value
 
 
 def _file_selection_state(d: dict):
@@ -293,8 +296,7 @@ def _file_selection_state(d: dict):
     items = _all_items_for_file(d)
     if not items:
         return False
-    sel     = _sel()
-    checked = [sel.get(_ck(d["filename"], i["key"]), True) for i in items]
+    checked = [_get_sel(d["filename"], i["key"]) for i in items]
     if all(checked):
         return True
     if not any(checked):
@@ -319,9 +321,8 @@ def _global_selection_state():
 
 
 def _set_file_items(d: dict, value: bool):
-    sel = _sel()
     for item in _all_items_for_file(d):
-        sel[_ck(d["filename"], item["key"])] = value
+        _set_sel(d["filename"], item["key"], value)
 
 
 def _set_all_items(value: bool):
@@ -339,7 +340,12 @@ def _toggle_icon(state) -> str:
 
 
 def _count_selected() -> int:
-    return sum(1 for v in _sel().values() if v)
+    total = 0
+    for d in st.session_state.import_data:
+        for item in _all_items_for_file(d):
+            if _get_sel(d["filename"], item["key"]):
+                total += 1
+    return total
 
 # ── end of import — checkbox / selection state helpers ───────────────────────
 
@@ -349,10 +355,14 @@ def _count_selected() -> int:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _analyze_uploaded_files(uploaded_files, importer):
-    st.session_state.import_data       = []
-    st.session_state.import_committed  = False
-    st.session_state.import_results    = {}
-    st.session_state.import_selections = {}   # full reset on new file list
+    # Clear all previous sel|| keys from session state
+    for key in list(st.session_state.keys()):
+        if key.startswith("sel||"):
+            del st.session_state[key]
+
+    st.session_state.import_data      = []
+    st.session_state.import_committed = False
+    st.session_state.import_results   = {}
 
     for f in uploaded_files:
         content        = f.read()
@@ -393,11 +403,10 @@ def _analyze_uploaded_files(uploaded_files, importer):
         }
         st.session_state.import_data.append(entry)
 
-        # Pre-populate selections — all items default to selected (True)
+        # Pre-populate all checkboxes as selected (True)
         if analysis:
-            sel = _sel()
             for item in _all_items_for_file(entry):
-                sel[_ck(f.name, item["key"])] = True
+                _set_sel(f.name, item["key"], True)
 
 
 def _execute_selected_imports(importer):
@@ -409,7 +418,6 @@ def _execute_selected_imports(importer):
         "source_files":    [],
     }
     doc_date = datetime.now().strftime("%Y-%m-%d")
-    sel      = _sel()
 
     for d in st.session_state.import_data:
         analysis = d["analysis"]
@@ -419,11 +427,11 @@ def _execute_selected_imports(importer):
 
         selected_new = [
             i for i in analysis["new_items"]
-            if sel.get(_ck(filename, i["key"]), True)
+            if _get_sel(filename, i["key"])
         ]
         selected_upd = [
             i for i in analysis["updates"]
-            if sel.get(_ck(filename, i["key"]), True)
+            if _get_sel(filename, i["key"])
         ]
         if not selected_new and not selected_upd:
             continue
@@ -473,7 +481,6 @@ def _render_select_all_toggle(state, button_key: str, label_suffix: str = "") ->
 
 def _render_import_review(importer):
     data         = st.session_state.import_data
-    sel          = _sel()
     total_files  = len(data)
     total_new    = sum(len(d["analysis"]["new_items"]) for d in data if d["analysis"])
     total_upd    = sum(len(d["analysis"]["updates"])   for d in data if d["analysis"])
@@ -482,14 +489,16 @@ def _render_import_review(importer):
         for d in data if d["analysis"]
     )
     total_warn   = sum(len(d["parse_warnings"]) for d in data)
-
-    # ── Read all checkbox return values first so sel is up-to-date ──
-    # (done inline below during per-file rendering; counts computed after)
+    selected_now = _count_selected()
+    global_state = _global_selection_state()
 
     # ── Top summary metrics ──────────────────────────────────────────
-    # We render metrics AFTER the per-file section so counts are current.
-    # Use a placeholder so the metrics appear at the top visually.
-    metrics_placeholder = st.empty()
+    mc1, mc2, mc3, mc4, mc5 = st.columns(5)
+    mc1.metric("Files",        total_files)
+    mc2.metric("🆕 New Items", total_new)
+    mc3.metric("🔄 Updates",   total_upd)
+    mc4.metric("⏭️ Skipped",   total_skip)
+    mc5.metric("✅ Selected",  selected_now)
 
     if total_warn:
         st.warning(f"⚠️ {total_warn} parsing issue(s) detected — see per-file details below.")
@@ -498,7 +507,6 @@ def _render_import_review(importer):
 
     # ── Global Select All + top Commit ──────────────────────────────
     gh1, gh2 = st.columns([3, 3])
-    global_state = _global_selection_state()
     with gh1:
         if _render_select_all_toggle(
             global_state, "glob_sel_top",
@@ -507,10 +515,9 @@ def _render_import_review(importer):
             _set_all_items(global_state is not True)
             st.rerun()
     with gh2:
-        selected_top = _count_selected()
-        commit_label = f"✅ Commit {selected_top} change{'s' if selected_top != 1 else ''}"
+        commit_label = f"✅ Commit {selected_now} change{'s' if selected_now != 1 else ''}"
         if st.button(commit_label, key="commit_top", type="primary",
-                     disabled=(selected_top == 0)):
+                     disabled=(selected_now == 0)):
             _execute_selected_imports(importer)
 
     st.markdown("---")
@@ -528,6 +535,8 @@ def _render_import_review(importer):
         file_items = _all_items_for_file(d)
         file_new   = len(analysis["new_items"]) if analysis else 0
         file_upd   = len(analysis["updates"])   if analysis else 0
+        file_state = _file_selection_state(d)
+        file_sel   = sum(1 for i in file_items if _get_sel(filename, i["key"]))
 
         fh1, fh2, fh3, fh4 = st.columns([4, 2, 2, 3])
         fh1.markdown(f"**📄 {filename}** &nbsp; `{size_str}`")
@@ -550,11 +559,6 @@ def _render_import_review(importer):
             fh4.success("✅ No parsing issues")
 
         # File-level Select All toggle
-        file_state = _file_selection_state(d)
-        file_sel   = sum(
-            1 for i in file_items if sel.get(_ck(filename, i["key"]), True)
-        )
-        # Strip all non-alphanumeric chars for safe button key
         safe_key = re.sub(r'[^a-zA-Z0-9]', '_', filename)
         fs1, _ = st.columns([3, 5])
         with fs1:
@@ -565,8 +569,8 @@ def _render_import_review(importer):
                 _set_file_items(d, file_state is not True)
                 st.rerun()
 
-        # Individual item checkboxes — NO key= parameter.
-        # We own all state in sel dict; capture return value each render.
+        # Individual item checkboxes — key= is the flat sel|| session_state key.
+        # Streamlit updates it natively on click and triggers rerun automatically.
         with st.expander(
             f"Items — {file_sel} of {len(file_items)} selected",
             expanded=True,
@@ -584,23 +588,10 @@ def _render_import_review(importer):
                     ]
                     change_note = f"  ·  *{',  '.join(parts)}*"
 
-                label       = f"{tag} **{item['description']}** `{item['key'].split('||')[1]}`{change_note}"
-                current_val = sel.get(ck, True)
-                new_val     = st.checkbox(label, value=current_val)
-                if new_val != current_val:
-                    sel[ck] = new_val   # update our dict; rerun triggered by checkbox
+                label = f"{tag} **{item['description']}** `{item['key'].split('||')[1]}`{change_note}"
+                st.checkbox(label, key=ck)
 
         st.markdown("---")
-
-    # ── Now fill in the top metrics placeholder with current counts ──
-    selected_now = _count_selected()
-    with metrics_placeholder.container():
-        mc1, mc2, mc3, mc4, mc5 = st.columns(5)
-        mc1.metric("Files",        total_files)
-        mc2.metric("🆕 New Items", total_new)
-        mc3.metric("🔄 Updates",   total_upd)
-        mc4.metric("⏭️ Skipped",   total_skip)
-        mc5.metric("✅ Selected",  selected_now)
 
     # ── Bottom commit bar ────────────────────────────────────────────
     selected_bot  = _count_selected()
