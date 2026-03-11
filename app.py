@@ -1,7 +1,7 @@
-"""
-Inventory Management System - Streamlit Web App
-Runs from anywhere via Streamlit Community Cloud
-"""
+# ──────────────────────────────────────────────────────────────────────────────
+#  app.py  —  UHA Inventory Management  —  Streamlit Web App
+#  Runs from anywhere via Streamlit Community Cloud
+# ──────────────────────────────────────────────────────────────────────────────
 
 import streamlit as st
 import pandas as pd
@@ -11,7 +11,10 @@ import os
 from datetime import datetime
 from typing import Optional
 
-# ── Page config (must be first Streamlit call) ──────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+#  PAGE CONFIG  (must be the very first Streamlit call)
+# ──────────────────────────────────────────────────────────────────────────────
+
 st.set_page_config(
     page_title="UHA Inventory",
     page_icon="🏟️",
@@ -19,28 +22,41 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ── Module imports ───────────────────────────────────────────────────
+# ── end of page config ────────────────────────────────────────────────────────
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  MODULE IMPORTS
+# ──────────────────────────────────────────────────────────────────────────────
+
 from database import InventoryDatabase
 from importer import InventoryImporter
 from gl_manager import GLCodeManager
 import onedrive_connector as od
 
+# ── end of module imports ─────────────────────────────────────────────────────
 
-# ────────────────────────────────────────────────────────────────────
-# SESSION STATE HELPERS
-# ────────────────────────────────────────────────────────────────────
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  CACHED RESOURCE HELPERS
+# ──────────────────────────────────────────────────────────────────────────────
+
 @st.cache_resource
 def get_db():
     return InventoryDatabase()
 
-
 def get_importer():
     return InventoryImporter(get_db())
-
 
 def get_gl():
     return GLCodeManager(get_db())
 
+# ── end of cached resource helpers ───────────────────────────────────────────
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  SESSION STATE INITIALIZERS
+# ──────────────────────────────────────────────────────────────────────────────
 
 def _init_import_state():
     if "import_data"      not in st.session_state:
@@ -50,19 +66,24 @@ def _init_import_state():
     if "import_results"   not in st.session_state:
         st.session_state.import_results   = {}
 
+# ── end of session state initializers ────────────────────────────────────────
 
-# ────────────────────────────────────────────────────────────────────
-# ONEDRIVE AUTH SIDEBAR
-# ────────────────────────────────────────────────────────────────────
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  SIDEBAR
+# ──────────────────────────────────────────────────────────────────────────────
+
 def onedrive_auth_sidebar():
     with st.sidebar:
         st.markdown("---")
         st.caption("☁️ OneDrive integration pending IT approval")
 
+# ── end of sidebar ────────────────────────────────────────────────────────────
 
-# ────────────────────────────────────────────────────────────────────
-# PAGES
-# ────────────────────────────────────────────────────────────────────
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  PAGE — DASHBOARD
+# ──────────────────────────────────────────────────────────────────────────────
 
 def page_dashboard():
     st.title("🏟️ UHA Inventory — Dashboard")
@@ -100,6 +121,12 @@ def page_dashboard():
             ] if c in df.columns]
             st.dataframe(df[cols], use_container_width=True, hide_index=True)
 
+# ── end of page — dashboard ───────────────────────────────────────────────────
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  PAGE — INVENTORY LIST + EDIT FORM
+# ──────────────────────────────────────────────────────────────────────────────
 
 def page_inventory():
     st.title("📦 Inventory Items")
@@ -226,10 +253,12 @@ def _edit_item_form(db, item: dict):
         st.success("✅ Saved!")
         st.rerun()
 
+# ── end of page — inventory list + edit form ─────────────────────────────────
 
-# ────────────────────────────────────────────────────────────────────
-# IMPORT PAGE — checkbox state helpers
-# ────────────────────────────────────────────────────────────────────
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  IMPORT — CHECKBOX / SELECTION STATE HELPERS
+# ──────────────────────────────────────────────────────────────────────────────
 
 def _ck(filename: str, item_key: str) -> str:
     """Unique session_state key for an individual item checkbox."""
@@ -243,11 +272,7 @@ def _all_items_for_file(d: dict) -> list:
 
 
 def _file_selection_state(d: dict):
-    """
-    Returns: True  = all checked
-             False = none checked
-             None  = some checked (indeterminate)
-    """
+    """True = all checked, False = none checked, None = indeterminate."""
     items = _all_items_for_file(d)
     if not items:
         return False
@@ -256,19 +281,15 @@ def _file_selection_state(d: dict):
         return True
     if not any(checked):
         return False
-    return None  # indeterminate
+    return None
 
 
-def _global_selection_state() -> object:
-    """
-    Returns: True  = all files fully checked
-             False = nothing checked anywhere
-             None  = mixed (indeterminate)
-    """
+def _global_selection_state():
+    """True = all files fully checked, False = nothing, None = mixed."""
     states = [_file_selection_state(d) for d in st.session_state.import_data if d.get("analysis")]
     if not states:
         return False
-    if all(s is True for s in states):
+    if all(s is True  for s in states):
         return True
     if all(s is False for s in states):
         return False
@@ -286,11 +307,7 @@ def _set_all_items(value: bool):
 
 
 def _toggle_icon(state) -> str:
-    """
-    True        → ☑  (all selected)
-    False       → ☐  (none selected)
-    None        → ▣  (some selected — indeterminate)
-    """
+    """☑ = all, ☐ = none, ▣ = indeterminate."""
     if state is True:
         return "☑"
     if state is False:
@@ -306,6 +323,12 @@ def _count_selected() -> int:
                 total += 1
     return total
 
+# ── end of import — checkbox / selection state helpers ───────────────────────
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  IMPORT — FILE ANALYSIS + EXECUTION
+# ──────────────────────────────────────────────────────────────────────────────
 
 def _analyze_uploaded_files(uploaded_files, importer):
     st.session_state.import_data      = []
@@ -316,6 +339,7 @@ def _analyze_uploaded_files(uploaded_files, importer):
         content        = f.read()
         parse_warnings = []
         analysis       = None
+        tmp_path       = None
         suffix         = ".csv" if f.name.lower().endswith(".csv") else ".xlsx"
 
         try:
@@ -325,6 +349,7 @@ def _analyze_uploaded_files(uploaded_files, importer):
 
             df_read = importer.read_file(tmp_path)
             os.unlink(tmp_path)
+            tmp_path = None
 
             if df_read is None:
                 parse_warnings.append(f"Read error: {'; '.join(importer.errors)}")
@@ -334,10 +359,11 @@ def _analyze_uploaded_files(uploaded_files, importer):
 
         except Exception as e:
             parse_warnings.append(str(e))
-            try:
-                os.unlink(tmp_path)
-            except Exception:
-                pass
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
 
         entry = {
             "filename":       f.name,
@@ -348,7 +374,6 @@ def _analyze_uploaded_files(uploaded_files, importer):
         }
         st.session_state.import_data.append(entry)
 
-        # Pre-populate checkboxes — default all True (selected)
         if analysis:
             for item in _all_items_for_file(entry):
                 ck = _ck(f.name, item["key"])
@@ -362,6 +387,7 @@ def _execute_selected_imports(importer):
         "new_items_added": 0,
         "items_updated":   0,
         "errors":          [],
+        "source_files":    [],
     }
     doc_date = datetime.now().strftime("%Y-%m-%d")
 
@@ -398,6 +424,12 @@ def _execute_selected_imports(importer):
         results["items_updated"]   += r.get("items_updated",   0)
         results["errors"].extend(r.get("errors", []))
         results["files_processed"] += 1
+        results["source_files"].append({
+            "filename": filename,
+            "size":     d["size"],
+            "new":      r.get("new_items_added", 0),
+            "updated":  r.get("items_updated",   0),
+        })
 
         if od.get_access_token():
             od.archive_file(filename, d["content"])
@@ -406,35 +438,33 @@ def _execute_selected_imports(importer):
     st.session_state.import_committed = True
     st.rerun()
 
+# ── end of import — file analysis + execution ─────────────────────────────────
 
-# ────────────────────────────────────────────────────────────────────
-# IMPORT REVIEW UI
-# ────────────────────────────────────────────────────────────────────
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  IMPORT — REVIEW UI  (select / deselect items before committing)
+# ──────────────────────────────────────────────────────────────────────────────
 
 def _render_select_all_toggle(state, button_key: str, label_suffix: str = "") -> bool:
-    """
-    Renders a single toggle button that shows ☐ / ☑ / ▣.
-    Returns True if clicked.
-    """
     icon  = _toggle_icon(state)
     label = f"{icon}  Select All{' ' + label_suffix if label_suffix else ''}"
     return st.button(label, key=button_key)
 
 
 def _render_import_review(importer):
-    data          = st.session_state.import_data
-    total_files   = len(data)
-    total_new     = sum(len(d["analysis"]["new_items"]) for d in data if d["analysis"])
-    total_upd     = sum(len(d["analysis"]["updates"])   for d in data if d["analysis"])
-    total_skip    = sum(
+    data         = st.session_state.import_data
+    total_files  = len(data)
+    total_new    = sum(len(d["analysis"]["new_items"]) for d in data if d["analysis"])
+    total_upd    = sum(len(d["analysis"]["updates"])   for d in data if d["analysis"])
+    total_skip   = sum(
         len(d["analysis"]["skipped"]) + len(d["analysis"]["errors"])
         for d in data if d["analysis"]
     )
-    total_warn    = sum(len(d["parse_warnings"]) for d in data)
-    selected_now  = _count_selected()
-    global_state  = _global_selection_state()
+    total_warn   = sum(len(d["parse_warnings"]) for d in data)
+    selected_now = _count_selected()
+    global_state = _global_selection_state()
 
-    # ── Top summary metrics ──────────────────────────────────────────
+    # Summary metrics
     mc1, mc2, mc3, mc4, mc5 = st.columns(5)
     mc1.metric("Files",        total_files)
     mc2.metric("🆕 New Items", total_new)
@@ -447,16 +477,15 @@ def _render_import_review(importer):
 
     st.markdown("---")
 
-    # ── Global Select All + top Commit ──────────────────────────────
+    # Global select-all toggle + top commit button
     gh1, gh2 = st.columns([3, 3])
-
     with gh1:
-        # Toggle: if all selected → clicking deselects all; otherwise → selects all
-        if _render_select_all_toggle(global_state, "glob_sel_top",
-                                     f"({total_new + total_upd} items across {total_files} files)"):
-            _set_all_items(global_state is not True)   # True→deselect, False/None→select
+        if _render_select_all_toggle(
+            global_state, "glob_sel_top",
+            f"({total_new + total_upd} items across {total_files} files)"
+        ):
+            _set_all_items(global_state is not True)
             st.rerun()
-
     with gh2:
         commit_label = f"✅ Commit {selected_now} change{'s' if selected_now != 1 else ''}"
         if st.button(commit_label, key="commit_top", type="primary",
@@ -465,7 +494,7 @@ def _render_import_review(importer):
 
     st.markdown("---")
 
-    # ── Per-file sections ────────────────────────────────────────────
+    # Per-file sections
     for d in data:
         filename   = d["filename"]
         analysis   = d["analysis"]
@@ -484,7 +513,6 @@ def _render_import_review(importer):
         file_new   = len(analysis["new_items"]) if analysis else 0
         file_upd   = len(analysis["updates"])   if analysis else 0
 
-        # File header row
         fh1, fh2, fh3, fh4 = st.columns([4, 2, 2, 3])
         fh1.markdown(f"**📄 {filename}** &nbsp; `{size_str}`")
         fh2.caption(f"🆕 {file_new} new")
@@ -505,24 +533,24 @@ def _render_import_review(importer):
         else:
             fh4.success("✅ No parsing issues")
 
-        # File-level Select All toggle
-        fs1, fs2 = st.columns([3, 5])
+        fs1, _ = st.columns([3, 5])
         with fs1:
             safe_key = filename.replace(" ", "_").replace(".", "_")
-            if _render_select_all_toggle(file_state, f"fsel_{safe_key}",
-                                         f"({file_sel}/{len(file_items)})"):
+            if _render_select_all_toggle(
+                file_state, f"fsel_{safe_key}",
+                f"({file_sel}/{len(file_items)})"
+            ):
                 _set_file_items(d, file_state is not True)
                 st.rerun()
 
-        # Individual items in expander
         with st.expander(
             f"Items — {file_sel} of {len(file_items)} selected",
             expanded=True,
         ):
             for item in file_items:
-                ck      = _ck(filename, item["key"])
-                is_new  = item in analysis["new_items"]
-                tag     = "🆕" if is_new else "🔄"
+                ck     = _ck(filename, item["key"])
+                is_new = item in analysis["new_items"]
+                tag    = "🆕" if is_new else "🔄"
 
                 change_note = ""
                 if not is_new and item.get("changes"):
@@ -532,22 +560,22 @@ def _render_import_review(importer):
                     ]
                     change_note = f"  ·  *{',  '.join(parts)}*"
 
-                label = f"{tag} **{item['description']}** `{item['key'].split('||')[1]}`{change_note}"
-                # Use the session_state value directly as the checkbox value
+                label       = f"{tag} **{item['description']}** `{item['key'].split('||')[1]}`{change_note}"
                 current_val = st.session_state.get(ck, True)
-                new_val = st.checkbox(label, value=current_val, key=ck)
-                # If individual item changed, Streamlit updates session_state automatically via key=
+                st.checkbox(label, value=current_val, key=ck)
 
         st.markdown("---")
 
-    # ── Bottom commit bar ────────────────────────────────────────────
+    # Bottom commit bar
     selected_bot  = _count_selected()
     global_state2 = _global_selection_state()
 
     bc1, bc2 = st.columns([3, 3])
     with bc1:
-        if _render_select_all_toggle(global_state2, "glob_sel_bot",
-                                     f"({total_new + total_upd} items across {total_files} files)"):
+        if _render_select_all_toggle(
+            global_state2, "glob_sel_bot",
+            f"({total_new + total_upd} items across {total_files} files)"
+        ):
             _set_all_items(global_state2 is not True)
             st.rerun()
     with bc2:
@@ -556,6 +584,12 @@ def _render_import_review(importer):
                      disabled=(selected_bot == 0)):
             _execute_selected_imports(importer)
 
+# ── end of import — review UI ────────────────────────────────────────────────
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  IMPORT — POST-COMMIT RESULTS SCREEN
+# ──────────────────────────────────────────────────────────────────────────────
 
 def _render_import_results():
     r = st.session_state.import_results
@@ -565,6 +599,24 @@ def _render_import_results():
     rc1.metric("Files Processed", r.get("files_processed", 0))
     rc2.metric("New Items Added",  r.get("new_items_added", 0))
     rc3.metric("Items Updated",    r.get("items_updated",   0))
+
+    # Per-file breakdown
+    source_files = r.get("source_files", [])
+    if source_files:
+        st.markdown("**Files included in this import:**")
+        sf_cols = st.columns(3)
+        for i, sf in enumerate(source_files):
+            size_str = (
+                f"{sf['size'] / 1024:.1f} KB"
+                if sf["size"] < 1_048_576
+                else f"{sf['size'] / 1_048_576:.1f} MB"
+            )
+            sf_cols[i % 3].markdown(
+                f"📄 `{sf['filename']}`  \n"
+                f"{size_str} &nbsp;·&nbsp; "
+                f"🆕 {sf['new']} added &nbsp;·&nbsp; "
+                f"🔄 {sf['updated']} updated"
+            )
 
     if r.get("errors"):
         with st.expander(f"⚠️ {len(r['errors'])} error(s)"):
@@ -578,10 +630,12 @@ def _render_import_results():
         st.session_state.import_results   = {}
         st.rerun()
 
+# ── end of import — post-commit results screen ───────────────────────────────
 
-# ────────────────────────────────────────────────────────────────────
-# IMPORT PAGE
-# ────────────────────────────────────────────────────────────────────
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  PAGE — IMPORT
+# ──────────────────────────────────────────────────────────────────────────────
 
 def page_import():
     st.title("📥 Import Files")
@@ -591,16 +645,20 @@ def page_import():
     tab1, tab2 = st.tabs(["📤 Upload from Computer", "☁️ Import from OneDrive"])
 
     with tab1:
-        st.subheader("Upload Invoice or Inventory CSV / XLSX")
-        uploaded = st.file_uploader(
-            "Drop vendor invoice CSV or PAC export here",
-            type=["csv", "xlsx"],
-            accept_multiple_files=True,
-            label_visibility="collapsed",
-        )
+        # Show the uploader only when not yet committed
+        if not st.session_state.import_committed:
+            st.subheader("Upload Invoice or Inventory CSV / XLSX")
+            uploaded = st.file_uploader(
+                "Drop vendor invoice CSV or PAC export here",
+                type=["csv", "xlsx"],
+                accept_multiple_files=True,
+                label_visibility="collapsed",
+            )
+        else:
+            uploaded = None
 
         if uploaded:
-            # Show uploaded files in a compact 3-column grid — no pagination
+            # Compact 3-column file grid — no pagination
             st.markdown("**Uploaded files:**")
             grid_cols = st.columns(3)
             for i, f in enumerate(uploaded):
@@ -620,12 +678,14 @@ def page_import():
                 with st.spinner(f"Analyzing {len(uploaded)} file(s)..."):
                     _analyze_uploaded_files(uploaded, importer)
 
-            if st.session_state.import_committed:
-                _render_import_results()
-            elif st.session_state.import_data:
+            if st.session_state.import_data:
                 _render_import_review(importer)
 
+        elif st.session_state.import_committed:
+            _render_import_results()
+
         else:
+            # Files were cleared — reset state
             if st.session_state.import_data:
                 st.session_state.import_data      = []
                 st.session_state.import_committed = False
@@ -663,6 +723,12 @@ def page_import():
                             )
                             od.archive_file(f["name"], content)
 
+# ── end of page — import ─────────────────────────────────────────────────────
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  PAGE — GL CODE MANAGER
+# ──────────────────────────────────────────────────────────────────────────────
 
 def page_gl_codes():
     st.title("🏷️ GL Code Manager")
@@ -708,6 +774,12 @@ def page_gl_codes():
         else:
             st.info("No GL mappings loaded yet.")
 
+# ── end of page — GL code manager ────────────────────────────────────────────
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  PAGE — CHANGE HISTORY
+# ──────────────────────────────────────────────────────────────────────────────
 
 def page_history():
     st.title("📜 Change History")
@@ -735,6 +807,12 @@ def page_history():
         else:
             st.info("No history found.")
 
+# ── end of page — change history ─────────────────────────────────────────────
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  PAGE — EXPORT
+# ──────────────────────────────────────────────────────────────────────────────
 
 def page_export():
     st.title("📤 Export")
@@ -774,10 +852,13 @@ def page_export():
             od.archive_file(filename, buffer.getvalue(), subfolder="Exports")
             st.success(f"Saved {filename} to OneDrive Archives.")
 
+# ── end of page — export ─────────────────────────────────────────────────────
 
-# ────────────────────────────────────────────────────────────────────
-# MAIN NAV
-# ────────────────────────────────────────────────────────────────────
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  MAIN NAV
+# ──────────────────────────────────────────────────────────────────────────────
+
 def main():
     with st.sidebar:
         st.image("https://img.icons8.com/emoji/96/stadium.png", width=60)
@@ -804,3 +885,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# ── end of main nav ───────────────────────────────────────────────────────────
