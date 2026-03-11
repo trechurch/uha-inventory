@@ -45,6 +45,7 @@ from importer import InventoryImporter
 from gl_manager import GLCodeManager
 from count_importer import CountImporter, CountImportMeta
 from status_bar import status_bar
+from ui_skeleton import build_default_registry, MenuBar, SidebarConfig
 import onedrive_connector as od
 
 # ── end of local module imports ───────────────────────────────────────────────
@@ -82,8 +83,6 @@ def get_gl():
 
 def get_count_importer():
     return CountImporter(_get_db())
-
-# ── end of cached resource helpers ───────────────────────────────────────────
 
 # ── end of cached resource helpers ───────────────────────────────────────────
 
@@ -732,10 +731,8 @@ def page_import():
             existing_names = [d["filename"] for d in st.session_state.import_data]
 
             if uploaded_names != existing_names:
-                with st.spinner(f"Analyzing {len(uploaded)} file(s)..."):
-                    status_bar.start(f"Analyzing {len(uploaded)} invoice file(s)...")
+                with status_bar.timed(f"Analyzing {len(uploaded)} invoice file(s)..."):
                     _analyze_uploaded_files(uploaded, importer)
-                    status_bar.done("Analysis complete")
 
             if st.session_state.import_data:
                 _render_import_review(importer)
@@ -999,12 +996,10 @@ def page_count_import():
         st.session_state.count_committed  = False
         st.session_state.count_results    = None
 
-        with st.spinner("Parsing file..."):
+        with status_bar.timed(f"Parsing {uploaded.name}..."):
             t0 = time.perf_counter()
-            status_bar.start(f"Parsing {uploaded.name}...")
             records, fmt = ci.parse(uploaded.name, content)
             parse_elapsed = time.perf_counter() - t0
-            status_bar.done(f"Parsed — {len(records)} records in {parse_elapsed:.2f}s")
         st.session_state.count_records = records
         st.session_state.count_fmt     = fmt
         st.session_state["parse_elapsed"] = parse_elapsed
@@ -1074,16 +1069,14 @@ def page_count_import():
     calc_key = f"{uploaded.name}|{flag_each}|{flag_value}|{'|'.join(sorted(location_filter))}"
     if (st.session_state.count_variance is None or
             st.session_state.get("_calc_key") != calc_key):
-        with st.spinner("Calculating variance..."):
+        with status_bar.timed(f"Variance diff — {len(work_records)} records..."):
             t0 = time.perf_counter()
-            status_bar.start(f"Bulk fetch — {len(work_records)} items...")
             variance = ci.calculate_variance(
                 work_records,
                 flag_each_threshold  = int(flag_each),
                 flag_value_threshold = float(flag_value),
             )
             var_elapsed = time.perf_counter() - t0
-            status_bar.done(f"Variance diff complete — {var_elapsed:.2f}s")
         st.session_state.count_variance      = variance
         st.session_state["_calc_key"]        = calc_key
         st.session_state["variance_elapsed"] = var_elapsed
@@ -1189,12 +1182,8 @@ def page_count_import():
             count_date   = str(count_date),
             imported_by  = "user",
         )
-        with st.spinner("Writing count to database..."):
-            status_bar.start(f"Committing {items_to_write} items...")
+        with status_bar.timed(f"Committing {items_to_write} items to database..."):
             results = ci.execute_count_import(variance, meta, add_missing=add_missing)
-            created = results.get("items_created", 0)
-            updated = results.get("items_updated", 0)
-            status_bar.done(f"Committed — {created} created · {updated} updated")
         st.session_state.count_results   = results
         st.session_state.count_committed = True
         st.rerun()
@@ -1301,39 +1290,111 @@ def _render_count_history():
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+#  PAGE — SETTINGS
+# ──────────────────────────────────────────────────────────────────────────────
+
+def page_settings():
+    st.title("⚙️ Settings")
+    reg = st.session_state["_registry"]
+
+    tab_feat, tab_sidebar, tab_prefs = st.tabs([
+        "🔧 Feature Toggles",
+        "◀️ Sidebar",
+        "👤 Preferences",
+    ])
+
+    with tab_feat:
+        st.subheader("Feature Toggles")
+        st.caption("Enabled features are live. Disabled features appear greyed out in the menu.")
+        for ft in reg.all_features():
+            col1, col2 = st.columns([3, 1])
+            col1.write(f"**{ft.name}** — {ft.description}")
+            new_val = col2.toggle(
+                "Enabled", value=ft.option_available,
+                key=f"ft_{ft.name}",
+            )
+            if new_val != ft.option_available:
+                reg.set(ft.name, new_val)
+                st.rerun()
+
+    with tab_sidebar:
+        st.subheader("Sidebar Settings")
+        cfg = st.session_state["_sidebar_cfg"]
+        cfg.visible        = st.toggle("Show Sidebar",           value=cfg.visible)
+        cfg.show_nav       = st.toggle("Show nav links",         value=cfg.show_nav)
+        cfg.show_cost_center = st.toggle("Show cost center badge", value=cfg.show_cost_center)
+        cfg.show_recent    = st.toggle("Show recent imports",    value=cfg.show_recent)
+        cfg.custom_label   = st.text_input("Sidebar label",      value=cfg.custom_label)
+        st.session_state["_sidebar_cfg"] = cfg
+        if st.button("Apply"):
+            st.rerun()
+
+    with tab_prefs:
+        st.subheader("Preferences")
+        st.info("User preferences coming soon.")
+
+# ── end of page — settings ────────────────────────────────────────────────────
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 #  MAIN NAV
 # ──────────────────────────────────────────────────────────────────────────────
 
 def main():
-    # Inject the fixed footer bar — must be first Streamlit call in main
-    status_bar.inject()
+    # ── Bootstrap registry + sidebar config (once per session) ───────────────
+    if "_registry" not in st.session_state:
+        st.session_state["_registry"] = build_default_registry()
+    if "_sidebar_cfg" not in st.session_state:
+        st.session_state["_sidebar_cfg"] = SidebarConfig()
 
-    with st.sidebar:
-        st.image("https://img.icons8.com/emoji/96/stadium.png", width=60)
-        st.title("UHA Inventory")
-        st.markdown("---")
-        page = st.radio("Navigate", [
-            "🏠 Dashboard",
-            "📦 Inventory",
-            "📥 Import",
-            "📋 Count Import",
-            "🏷️ GL Codes",
-            "📜 History",
-            "📤 Export",
-        ])
+    reg         = st.session_state["_registry"]
+    sidebar_cfg = st.session_state["_sidebar_cfg"]
+    menubar     = MenuBar(reg)
+
+    # ── Inject top nav + footer ───────────────────────────────────────────────
+    status_bar.inject(menubar=menubar, sidebar_visible=sidebar_cfg.visible)
+
+    # ── Determine current page from query params ──────────────────────────────
+    page = st.query_params.get("page", "dashboard")
+
+    # ── Sidebar (optional) ────────────────────────────────────────────────────
+    if sidebar_cfg.visible:
+        with st.sidebar:
+            if sidebar_cfg.show_cost_center:
+                st.markdown(f"**{sidebar_cfg.custom_label}**")
+                st.markdown("---")
+            if sidebar_cfg.show_nav:
+                nav_items = [
+                    ("🏠 Dashboard",         "dashboard"),
+                    ("📦 Inventory",         "inventory"),
+                    ("📥 Import",            "import"),
+                    ("📋 Count Import",      "count_import"),
+                    ("🏷️  GL Codes",          "gl_codes"),
+                    ("📜 History",           "history"),
+                    ("📤 Export",            "export"),
+                    ("⚙️  Settings",          "settings"),
+                ]
+                for label, key in nav_items:
+                    if reg.is_enabled(key.replace("_", "").replace(" ", "")):
+                        if st.button(label, key=f"nav_{key}",
+                                     use_container_width=True):
+                            st.query_params["page"] = key
+                            st.rerun()
 
     onedrive_auth_sidebar()
 
-    if   page == "🏠 Dashboard":    page_dashboard()
-    elif page == "📦 Inventory":    page_inventory()
-    elif page == "📥 Import":       page_import()
-    elif page == "📋 Count Import": page_count_import()
-    elif page == "🏷️ GL Codes":     page_gl_codes()
-    elif page == "📜 History":      page_history()
-    elif page == "📤 Export":       page_export()
-
-    # Return bar to idle pulse after every page render
-    status_bar.idle()
+    # ── Route to page ─────────────────────────────────────────────────────────
+    if   page == "dashboard":       page_dashboard()
+    elif page == "inventory":       page_inventory()
+    elif page == "import":          page_import()
+    elif page == "count_import":    page_count_import()
+    elif page == "gl_codes":        page_gl_codes()
+    elif page == "history":         page_history()
+    elif page == "export":          page_export()
+    elif page in ("settings",
+                  "settings_sidebar",
+                  "settings_prefs"): page_settings()
+    else:                           page_dashboard()
 
 
 if __name__ == "__main__":

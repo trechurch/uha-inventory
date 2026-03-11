@@ -1,181 +1,276 @@
 # ──────────────────────────────────────────────────────────────────────────────
-#  status_bar.py  —  Persistent Animated Status / Progress Bar
+#  status_bar.py  —  Top Nav Bar + Footer Status Ticker
 #
-#  Visual:  A fixed footer bar with two layers —
-#    • Background:  monospace process-text scrolling horizontally (CSS animation)
-#    • Foreground:  a semi-transparent color fill sweeping left → right like a
-#                   progress bar, overlaid on the scrolling text
-#
-#  Usage:
-#    from status_bar import StatusBar
-#
-#    bar = StatusBar()
-#    bar.inject()                          # call once per page render in main()
-#
-#    bar.start("Parsing file...")          # 0 %  — kicks off animation
-#    bar.update(0.3, "Reading rows...")    # 30%
-#    bar.update(0.7, "Calculating...")     # 70%
-#    bar.done("Complete — 1145 items")     # 100%, then fades
-#    bar.idle()                            # back to subtle idle pulse
+#  Two injected layers:
+#    1. inject_topnav(menubar, registry)  — fixed top bar with CSS dropdown
+#       menus.  Disabled items are greyed out + non-interactive.
+#       Clicks set st.query_params["page"] to trigger Streamlit reruns.
+#    2. inject_footer()  — fixed bottom ticker + native st.progress() helpers
+#       for real-time operation feedback.
 # ──────────────────────────────────────────────────────────────────────────────
 
+import time
+import contextlib
 import streamlit as st
-import streamlit.components.v1 as components
 
 # ── end of imports ────────────────────────────────────────────────────────────
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  SCROLL TEXT CORPUS  —  cycles through in the background layer
+#  TOP NAV CSS + HTML TEMPLATE
+# ──────────────────────────────────────────────────────────────────────────────
+
+_TOPNAV_CSS = """
+<style>
+/* ── Push Streamlit content down so it clears the nav bar ────────────────── */
+.stApp > header { display: none !important; }
+.main .block-container {
+  padding-top:    54px  !important;
+  padding-bottom: 50px  !important;
+}
+section[data-testid="stSidebar"] > div:first-child {
+  padding-top: 54px !important;
+}
+
+/* ── Fixed top nav bar ────────────────────────────────────────────────────── */
+#uha-topnav {
+  position:    fixed;
+  top:         0;
+  left:        0;
+  right:       0;
+  height:      42px;
+  z-index:     99999;
+  background:  #0e1117;
+  border-bottom: 1px solid #1e2530;
+  display:     flex;
+  align-items: center;
+  padding:     0 16px;
+  gap:         4px;
+  font-family: 'Segoe UI', sans-serif;
+  font-size:   13px;
+  user-select: none;
+}
+
+/* ── App title / logo ─────────────────────────────────────────────────────── */
+#uha-topnav .uha-brand {
+  color:        #5ab4e4;
+  font-weight:  700;
+  font-size:    14px;
+  letter-spacing: 0.5px;
+  margin-right: 12px;
+  white-space:  nowrap;
+}
+
+/* ── Menu trigger buttons ─────────────────────────────────────────────────── */
+.uha-menu {
+  position:   relative;
+  display:    inline-block;
+}
+.uha-menu-btn {
+  background:  transparent;
+  border:      none;
+  color:       #8ab4d4;
+  padding:     6px 10px;
+  cursor:      pointer;
+  border-radius: 4px;
+  font-size:   13px;
+  font-family: inherit;
+  transition:  background 0.15s, color 0.15s;
+}
+.uha-menu-btn:hover,
+.uha-menu:hover .uha-menu-btn {
+  background: #1e2a3a;
+  color:      #c8e0f0;
+}
+
+/* ── Dropdown panel ───────────────────────────────────────────────────────── */
+.uha-dropdown {
+  display:       none;
+  position:      absolute;
+  top:           100%;
+  left:          0;
+  min-width:     190px;
+  background:    #131820;
+  border:        1px solid #2a3a4a;
+  border-radius: 4px;
+  box-shadow:    0 4px 16px rgba(0,0,0,0.5);
+  z-index:       100000;
+  padding:       4px 0;
+}
+.uha-menu:hover .uha-dropdown {
+  display: block;
+}
+
+/* ── Dropdown items ───────────────────────────────────────────────────────── */
+.uha-item {
+  display:     block;
+  padding:     7px 16px;
+  color:       #a0c4e0;
+  cursor:      pointer;
+  white-space: nowrap;
+  font-size:   12px;
+  text-decoration: none;
+  transition:  background 0.1s;
+}
+.uha-item:hover {
+  background: #1e2a3a;
+  color:      #e0f0ff;
+}
+
+/* ── Disabled items ───────────────────────────────────────────────────────── */
+.uha-item.uha-disabled {
+  color:          #3a4a5a;
+  cursor:         default;
+  pointer-events: none;
+}
+.uha-item.uha-disabled:hover {
+  background: transparent;
+}
+
+/* ── Separator ────────────────────────────────────────────────────────────── */
+.uha-sep {
+  height:      1px;
+  background:  #1e2a3a;
+  margin:      4px 0;
+}
+
+/* ── Right-side controls (sidebar toggle, etc.) ───────────────────────────── */
+#uha-topnav .uha-right {
+  margin-left: auto;
+  display:     flex;
+  align-items: center;
+  gap:         8px;
+}
+.uha-icon-btn {
+  background:  transparent;
+  border:      none;
+  color:       #5a7a9a;
+  font-size:   15px;
+  cursor:      pointer;
+  padding:     4px 7px;
+  border-radius: 4px;
+  transition:  background 0.15s, color 0.15s;
+}
+.uha-icon-btn:hover {
+  background: #1e2a3a;
+  color:      #8ab4d4;
+}
+.uha-icon-btn.uha-active {
+  color:      #5ab4e4;
+  background: #1a2a3a;
+}
+
+/* ── Sidebar hide/show ────────────────────────────────────────────────────── */
+body.uha-sidebar-hidden section[data-testid="stSidebar"] {
+  display: none !important;
+}
+body.uha-sidebar-hidden .main .block-container {
+  max-width: 100% !important;
+  padding-left: 2rem !important;
+}
+</style>
+"""
+
+# ── end of top nav CSS ────────────────────────────────────────────────────────
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  FOOTER CSS + TICKER
 # ──────────────────────────────────────────────────────────────────────────────
 
 _SCROLL_WORDS = (
-    "PARSING · FETCHING · NORMALIZING · BUILDING KEY · DIFF · "
-    "VARIANCE · BULK FETCH · COMMITTING · WRITING · INDEXING · "
-    "MATCHING · GL MAP · PACK TYPE · CONV RATIO · ITEM KEY · "
-    "SUPABASE · QUERY · INSERT · UPDATE · ROLLBACK · COMMIT · "
-    "CHARGEABLE · LOCATION · SEQ · UOM · PRICE · TOTAL · EACH · "
-    "CASE · SEPARATED · COMBINED · FLAGGED · THRESHOLD · HASH · "
-    "POOL · CONNECTION · CURSOR · EXECUTE · FETCH · BATCH · "
-    "PARSING · FETCHING · NORMALIZING · BUILDING KEY · DIFF · "
+    "PARSING · FETCHING · NORMALIZING · BUILDING KEY · VARIANCE DIFF · "
+    "BULK FETCH · COMMITTING · WRITING · INDEXING · MATCHING · GL MAP · "
+    "PACK TYPE · CONV RATIO · ITEM KEY · SUPABASE · QUERY · INSERT · "
+    "UPDATE · ROLLBACK · COMMIT · CHARGEABLE · LOCATION · SEQ · UOM · "
+    "PRICE · TOTAL · EACH · CASE · SEPARATED · COMBINED · FLAGGED · "
+    "THRESHOLD · HASH · POOL · CONNECTION · CURSOR · EXECUTE · BATCH · "
 )
 
-# ── end of scroll text corpus ─────────────────────────────────────────────────
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  CSS + JS INJECTION  —  fixed footer bar, injected once per app load
-# ──────────────────────────────────────────────────────────────────────────────
-
-_INJECT_CSS = """
+_FOOTER_CSS = """
 <style>
-  /* ── Fixed footer bar ──────────────────────────────────────────────────── */
-  #uha-status-bar {
-    position:   fixed;
-    bottom:     0;
-    left:       0;
-    right:      0;
-    height:     28px;
-    z-index:    9999;
-    font-family: 'Courier New', Courier, monospace;
-    font-size:  11px;
-    overflow:   hidden;
-    background: #0e1117;
-    border-top: 1px solid #2a2d35;
-    display:    flex;
-    align-items: center;
-  }
-
-  /* ── Scrolling background text ─────────────────────────────────────────── */
-  #uha-scroll-text {
-    position:   absolute;
-    top:        0; left: 0; right: 0; bottom: 0;
-    white-space: nowrap;
-    color:      #2a4a6a;
-    line-height: 28px;
-    padding:    0 8px;
-    animation:  uha-scroll 18s linear infinite;
-  }
-  @keyframes uha-scroll {
-    0%   { transform: translateX(0); }
-    100% { transform: translateX(-50%); }
-  }
-
-  /* ── Progress fill overlay ──────────────────────────────────────────────── */
-  #uha-progress-fill {
-    position:   absolute;
-    top:        0; left: 0; bottom: 0;
-    width:      0%;
-    background: rgba(0, 180, 255, 0.18);
-    border-right: 2px solid rgba(0, 180, 255, 0.7);
-    transition: width 0.4s ease, background 0.3s ease, border-color 0.3s ease;
-    z-index:    1;
-  }
-
-  /* ── Status label ────────────────────────────────────────────────────────── */
-  #uha-status-label {
-    position:   relative;
-    z-index:    2;
-    padding:    0 12px;
-    color:      #8ab4d4;
-    font-weight: bold;
-    letter-spacing: 0.5px;
-    white-space: nowrap;
-    overflow:   hidden;
-    text-overflow: ellipsis;
-    max-width:  60%;
-    transition: color 0.3s ease;
-  }
-
-  /* ── Right-side timing badge ─────────────────────────────────────────────── */
-  #uha-status-timing {
-    position:   absolute;
-    right:      10px;
-    z-index:    2;
-    color:      #4a6a8a;
-    font-size:  10px;
-    letter-spacing: 0.3px;
-  }
-
-  /* ── Done state ──────────────────────────────────────────────────────────── */
-  .uha-done #uha-progress-fill {
-    background:  rgba(0, 220, 130, 0.18);
-    border-color: rgba(0, 220, 130, 0.8);
-  }
-  .uha-done #uha-status-label {
-    color: #00dc82;
-  }
-
-  /* ── Error state ─────────────────────────────────────────────────────────── */
-  .uha-error #uha-progress-fill {
-    background:  rgba(255, 80, 80, 0.18);
-    border-color: rgba(255, 80, 80, 0.8);
-  }
-  .uha-error #uha-status-label {
-    color: #ff5050;
-  }
-
-  /* ── Idle pulse ──────────────────────────────────────────────────────────── */
-  .uha-idle #uha-progress-fill {
-    animation: uha-idle-pulse 3s ease-in-out infinite;
-    border-color: rgba(0, 120, 180, 0.4);
-  }
-  @keyframes uha-idle-pulse {
-    0%, 100% { width: 0%;   opacity: 0.4; }
-    50%       { width: 12%;  opacity: 0.8; }
-  }
-
-  /* ── Streamlit bottom padding so content isn't hidden behind bar ────────── */
-  .main .block-container { padding-bottom: 48px !important; }
+#uha-status-bar {
+  position:    fixed;
+  bottom:      0;
+  left:        0;
+  right:       0;
+  height:      26px;
+  z-index:     9999;
+  overflow:    hidden;
+  background:  #0e1117;
+  border-top:  1px solid #1e2530;
+  display:     flex;
+  align-items: center;
+}
+#uha-ticker {
+  position:    absolute;
+  top: 0; left: 0; right: 0; bottom: 0;
+  white-space: nowrap;
+  font-family: 'Courier New', monospace;
+  font-size:   10px;
+  color:       #1a3550;
+  line-height: 26px;
+  padding:     0 8px;
+  animation:   uha-scroll 22s linear infinite;
+  user-select: none;
+}
+@keyframes uha-scroll {
+  0%   { transform: translateX(0); }
+  100% { transform: translateX(-50%); }
+}
+#uha-status-bar.uha-active #uha-ticker {
+  color:     #2a5a8a;
+  animation: uha-scroll 8s linear infinite;
+}
+#uha-status-bar.uha-active::after {
+  content:    '';
+  position:   absolute;
+  top: 0; bottom: 0;
+  left: -40%;
+  width: 35%;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(0,160,255,0.12) 40%,
+    rgba(0,200,255,0.22) 50%,
+    rgba(0,160,255,0.12) 60%,
+    transparent 100%
+  );
+  animation: uha-sweep 1.8s ease-in-out infinite;
+}
+@keyframes uha-sweep {
+  0%   { left: -40%; }
+  100% { left: 110%; }
+}
+#uha-status-bar.uha-done #uha-ticker { color: #1a5a3a; }
+#uha-status-bar.uha-done::after {
+  content:  '';
+  position: absolute;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background: rgba(0,200,100,0.07);
+}
+#uha-label {
+  position:    absolute;
+  right:       10px;
+  font-family: 'Courier New', monospace;
+  font-size:   10px;
+  color:       #3a6a9a;
+  z-index:     2;
+  white-space: nowrap;
+}
+#uha-status-bar.uha-active #uha-label { color: #5ab4e4; }
+#uha-status-bar.uha-done   #uha-label { color: #00dc82; }
 </style>
-
-<div id="uha-status-bar" class="uha-idle">
-  <div id="uha-scroll-text">{scroll_text}</div>
-  <div id="uha-progress-fill"></div>
-  <span id="uha-status-label">⬡ UHA IMS ready</span>
-  <span id="uha-status-timing"></span>
-</div>
-
-<script>
-  // Store start time for elapsed display
-  window._uhaStart = null;
-
-  window._uhaSet = function(pct, label, state, elapsed) {
-    var bar   = document.getElementById('uha-status-bar');
-    var fill  = document.getElementById('uha-progress-fill');
-    var lbl   = document.getElementById('uha-status-label');
-    var tim   = document.getElementById('uha-status-timing');
-    if (!bar) return;
-
-    bar.className = state || '';
-    fill.style.width = (pct * 100).toFixed(1) + '%';
-    lbl.textContent = label || '';
-    tim.textContent = elapsed ? elapsed + 's' : '';
-  };
-</script>
 """
 
-# ── end of CSS + JS injection ─────────────────────────────────────────────────
+_FOOTER_HTML = """
+<div id="uha-status-bar">
+  <div id="uha-ticker">TICKER_PLACEHOLDER</div>
+  <span id="uha-label">⬡ UHA IMS</span>
+</div>
+"""
+
+# ── end of footer CSS ─────────────────────────────────────────────────────────
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -183,103 +278,180 @@ _INJECT_CSS = """
 # ──────────────────────────────────────────────────────────────────────────────
 
 class StatusBar:
-    """
-    Manages the fixed-footer status bar.
-
-    Lifecycle per page render:
-      bar = StatusBar()
-      bar.inject()        # renders the fixed bar HTML once
-      bar.start(msg)      # shows active state at 0%
-      bar.update(pct, msg)
-      bar.done(msg)
-      bar.idle()          # back to subtle pulse (call at end of page render)
-    """
 
     # ──────────────────────────────────────────────────────────────────────────
-    #  INJECT  —  render the fixed bar into the page (once per render)
+    #  INJECT TOP NAV  —  render top bar with menus from MenuBar + registry
     # ──────────────────────────────────────────────────────────────────────────
 
-    def inject(self):
+    def inject_topnav(self, menubar, sidebar_visible: bool = True):
         """
-        Render the fixed footer CSS + HTML into the page.
-        Must be called near the top of every page function so the bar
-        is present regardless of which page is active.
+        Render the fixed top nav bar.
+        menubar: ui_skeleton.MenuBar instance
+        sidebar_visible: current state of the sidebar toggle
         """
-        scroll = (_SCROLL_WORDS + "  " + _SCROLL_WORDS)
-        # Use simple replace rather than .format() so CSS/JS braces don't
-        # need escaping — {scroll_text} is the only placeholder in the template.
-        html = _INJECT_CSS.replace("{scroll_text}", scroll)
-        st.markdown(html, unsafe_allow_html=True)
-        if "_status_ph" not in st.session_state:
-            st.session_state["_status_ph"] = st.empty()
-
-    # ── end of inject ─────────────────────────────────────────────────────────
-
-
-    # ──────────────────────────────────────────────────────────────────────────
-    #  STATE UPDATES  —  push new state to the bar via JS injection
-    # ──────────────────────────────────────────────────────────────────────────
-
-    def _push(self, pct: float, label: str, state: str, elapsed: str = ""):
-        """
-        Push a state update to the bar by injecting a tiny JS snippet
-        that calls window._uhaSet().
-        """
-        safe_label = label.replace("'", "\\'").replace('"', '\\"')
-        js = (
-            f"<script>"
-            f"(function(){{"
-            f"  var t = setInterval(function(){{"
-            f"    if(window._uhaSet){{"
-            f"      window._uhaSet({pct:.3f}, '{safe_label}', '{state}', '{elapsed}');"
-            f"      clearInterval(t);"
-            f"    }}"
-            f"  }}, 30);"
-            f"}})();"
-            f"</script>"
+        menu_html = self._build_menu_html(menubar)
+        sidebar_btn_class = "uha-icon-btn uha-active" if sidebar_visible else "uha-icon-btn"
+        sidebar_js = (
+            "document.body.classList.toggle('uha-sidebar-hidden');"
+            "this.classList.toggle('uha-active');"
         )
-        st.markdown(js, unsafe_allow_html=True)
 
-    def start(self, message: str = "Working..."):
-        """Kick off — active state at 5%."""
-        st.session_state["_status_start"] = __import__("time").perf_counter()
-        self._push(0.05, f"⟳  {message}", "")
+        html = _TOPNAV_CSS + f"""
+<div id="uha-topnav">
+  <span class="uha-brand">⬡ UHA IMS</span>
+  {menu_html}
+  <div class="uha-right">
+    <button class="{sidebar_btn_class}" onclick="{sidebar_js}"
+            title="Toggle sidebar">◀</button>
+  </div>
+</div>
+"""
+        st.markdown(html, unsafe_allow_html=True)
 
-    def update(self, pct: float, message: str):
-        """Update progress (0.0 – 1.0) and label."""
-        elapsed = ""
-        if "_status_start" in st.session_state:
-            secs    = __import__("time").perf_counter() - st.session_state["_status_start"]
-            elapsed = f"{secs:.1f}"
-        self._push(min(pct, 0.97), f"⟳  {message}", "", elapsed)
+    def _build_menu_html(self, menubar) -> str:
+        parts = []
+        for menu in menubar.menus:
+            items_html = ""
+            for item in menu.children:
+                if item.separator:
+                    items_html += '<div class="uha-sep"></div>'
+                    continue
+                enabled   = menubar.is_item_enabled(item)
+                css_class = "uha-item" if enabled else "uha-item uha-disabled"
+                if enabled and item.page_key:
+                    onclick = (
+                        f"window.location.href = "
+                        f"window.location.pathname + "
+                        f"'?page={item.page_key}';"
+                    )
+                    items_html += (
+                        f'<a class="{css_class}" onclick="{onclick}" href="#">'
+                        f'{item.full_label}</a>'
+                    )
+                else:
+                    items_html += (
+                        f'<span class="{css_class}">'
+                        f'{item.full_label}</span>'
+                    )
+            parts.append(
+                f'<div class="uha-menu">'
+                f'  <button class="uha-menu-btn">{menu.label} ▾</button>'
+                f'  <div class="uha-dropdown">{items_html}</div>'
+                f'</div>'
+            )
+        return "\n".join(parts)
 
-    def done(self, message: str = "Done"):
-        """Complete — green state at 100%."""
-        elapsed = ""
-        if "_status_start" in st.session_state:
-            secs    = __import__("time").perf_counter() - st.session_state["_status_start"]
-            elapsed = f"{secs:.1f}"
-            st.session_state.pop("_status_start", None)
-        self._push(1.0, f"✓  {message}", "uha-done", elapsed)
+    # ── end of inject top nav ─────────────────────────────────────────────────
 
-    def error(self, message: str = "Error"):
-        """Error state — red fill."""
-        st.session_state.pop("_status_start", None)
-        self._push(1.0, f"✗  {message}", "uha-error")
 
-    def idle(self):
-        """Return to subtle idle pulse."""
-        st.session_state.pop("_status_start", None)
-        self._push(0.0, "⬡  UHA IMS ready", "uha-idle")
+    # ──────────────────────────────────────────────────────────────────────────
+    #  INJECT FOOTER  —  render the bottom ticker bar
+    # ──────────────────────────────────────────────────────────────────────────
 
-    # ── end of state updates ──────────────────────────────────────────────────
+    def inject_footer(self):
+        """Render the fixed footer ticker. Call once per page render."""
+        scroll = _SCROLL_WORDS * 2
+        html   = _FOOTER_CSS + _FOOTER_HTML.replace("TICKER_PLACEHOLDER", scroll)
+        st.markdown(html, unsafe_allow_html=True)
 
+    def inject(self, menubar=None, sidebar_visible: bool = True):
+        """
+        Convenience: inject both top nav and footer in one call.
+        If menubar is None, only the footer is injected.
+        """
+        if menubar is not None:
+            self.inject_topnav(menubar, sidebar_visible=sidebar_visible)
+        self.inject_footer()
+
+    # ── end of inject footer ──────────────────────────────────────────────────
+
+
+    # ──────────────────────────────────────────────────────────────────────────
+    #  WORKING CONTEXT MANAGER  —  native st.progress() for real-time feedback
+    # ──────────────────────────────────────────────────────────────────────────
+
+    @contextlib.contextmanager
+    def working(self, label: str, total: int = 0):
+        """
+        Context manager with a yielded progress callback.
+
+        Usage:
+            with status_bar.working("Parsing...", total=len(rows)) as pb:
+                for i, row in enumerate(rows):
+                    process(row)
+                    pb(i + 1, f"Row {i+1}")
+        """
+        t0        = time.perf_counter()
+        container = st.empty()
+        _total    = total
+
+        class _PB:
+            def __init__(self):
+                self._last = 0.0
+            def __call__(self_, current: int, message: str = ""):
+                pct     = min(current / _total, 1.0) if _total > 0 else 0.0
+                elapsed = time.perf_counter() - t0
+                with container.container():
+                    st.progress(pct, text=(
+                        f"{message}  ·  ⏱ {elapsed:.1f}s"
+                        if message else f"⏱ {elapsed:.1f}s"
+                    ))
+                self_._last = pct
+
+        pb = _PB()
+        with container.container():
+            st.progress(0.0, text=f"⟳  {label}")
+
+        try:
+            yield pb
+            elapsed = time.perf_counter() - t0
+            with container.container():
+                st.progress(1.0, text=f"✓  {label} — {elapsed:.2f}s")
+            time.sleep(0.6)
+        except Exception:
+            with container.container():
+                st.progress(pb._last, text=f"✗  Error during: {label}")
+            raise
+        finally:
+            container.empty()
+
+    # ── end of working context manager ────────────────────────────────────────
+
+
+    # ──────────────────────────────────────────────────────────────────────────
+    #  TIMED CONTEXT MANAGER  —  indeterminate progress for single-shot ops
+    # ──────────────────────────────────────────────────────────────────────────
+
+    @contextlib.contextmanager
+    def timed(self, label: str):
+        """
+        Shows a progress bar at 15% (indeterminate) during work,
+        then snaps to 100% with elapsed time on completion.
+        """
+        t0        = time.perf_counter()
+        container = st.empty()
+        with container.container():
+            st.progress(0.15, text=f"⟳  {label}")
+        try:
+            yield
+            elapsed = time.perf_counter() - t0
+            with container.container():
+                st.progress(1.0, text=f"✓  {label} — {elapsed:.2f}s")
+            time.sleep(0.5)
+        except Exception:
+            with container.container():
+                st.progress(0.15, text=f"✗  Error: {label}")
+            raise
+        finally:
+            container.empty()
+
+    # ── end of timed context manager ──────────────────────────────────────────
 
 # ── end of StatusBar class ────────────────────────────────────────────────────
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  MODULE-LEVEL SINGLETON  —  import and use directly
+#  MODULE-LEVEL SINGLETON
 # ──────────────────────────────────────────────────────────────────────────────
 
 status_bar = StatusBar()
