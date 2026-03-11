@@ -23,6 +23,8 @@ from typing import List, Dict, Optional, Tuple
 
 import pandas as pd
 
+from importer import normalize_pack_type
+
 # ── end of imports ────────────────────────────────────────────────────────────
 
 
@@ -185,9 +187,9 @@ def _parse_combined_price(text: str) -> Tuple[float, float]:
 
 
 def _build_key(description: str, pack_type: str) -> str:
-    """Canonical key: 'DESCRIPTION||PACK_TYPE' both uppercase."""
+    """Canonical key: 'DESCRIPTION||PACK_TYPE' — pack_type normalized to match DB."""
     desc = str(description or '').strip().upper()
-    pack = str(pack_type or '').strip().upper()
+    pack = normalize_pack_type(pack_type)   # CS→CASE, EA→EACH, etc.
     if not desc:
         return ''
     return f"{desc}||{pack}" if pack else f"{desc}||CASE"
@@ -760,36 +762,79 @@ class CountImporter:
         self,
         variance_records: List[VarianceRecord],
         meta:             CountImportMeta,
+        add_missing:      bool = False,
     ) -> Dict:
         """
         Writes the count to the database:
-        1. Updates quantity_on_hand for each matched item
-        2. Logs the import in count_imports
-        3. Saves all variance detail rows in count_variance_detail
+        1. Optionally creates new items for records not currently in DB
+        2. Updates quantity_on_hand for each matched item
+        3. Logs the import in count_imports
+        4. Saves all variance detail rows in count_variance_detail
+
+        add_missing=True:  items not found in DB are created from CountRecord
+                           data (description, pack_type, cost, location, etc.)
+                           and then their qty is set from the count.
+        add_missing=False: items not in DB are skipped (original behavior).
+
         Returns a summary dict.
         """
         results = {
-            'import_id':      meta.import_id,
-            'items_updated':  0,
-            'items_skipped':  0,
-            'items_flagged':  0,
-            'errors':         [],
+            'import_id':        meta.import_id,
+            'items_created':    0,
+            'items_updated':    0,
+            'items_skipped':    0,
+            'items_flagged':    0,
+            'errors':           [],
             'total_prev_value': 0.0,
             'total_new_value':  0.0,
             'total_variance_value': 0.0,
         }
 
+        # ── Pre-compute value totals ─────────────────────────────────────────
         for vr in variance_records:
             rec = vr.record
-            results['total_prev_value'] += vr.db_qty * (
+            results['total_prev_value']      += vr.db_qty * (
                 vr.db_price_each if vr.db_price_each else rec.price_each)
-            results['total_new_value']  += vr.new_qty * (
+            results['total_new_value']        += vr.new_qty * (
                 rec.price_each if rec.price_each else vr.db_price_each)
-            results['total_variance_value'] += vr.variance_value
+            results['total_variance_value']   += vr.variance_value
             if vr.is_flagged:
                 results['items_flagged'] += 1
 
-        # ── Pass 1: update item qty ──────────────────────────────────────────
+        # ── Pass 1: create missing items if requested ────────────────────────
+        if add_missing:
+            missing = [vr for vr in variance_records if not vr.in_db]
+            for vr in missing:
+                rec = vr.record
+                new_item = {
+                    'key':              rec.item_key,
+                    'description':      rec.item_description.strip().upper(),
+                    'pack_type':        rec.pack_type,
+                    'cost':             rec.price_each or rec.price_case or 0.0,
+                    'quantity_on_hand': vr.new_qty,
+                    'is_chargeable':    rec.is_chargeable,
+                    'cost_center':      meta.cost_center,
+                    'status_tag':       '📦 From Count',
+                    'user_notes':       (
+                        f"Created from count import {meta.import_id} "
+                        f"· location: {rec.location} · {meta.count_date}"
+                    ),
+                }
+                try:
+                    ok = self.db.add_item(new_item, changed_by=meta.imported_by)
+                    if ok:
+                        results['items_created'] += 1
+                        # Mark as now in_db so Pass 2 can update qty
+                        vr.in_db = True
+                    else:
+                        results['errors'].append(
+                            f"Could not create {rec.item_key} (may already exist)")
+                        results['items_skipped'] += 1
+                except Exception as e:
+                    results['errors'].append(f"Create {rec.item_key}: {e}")
+                    results['items_skipped'] += 1
+
+        # ── Pass 2: update qty for all in-DB items ───────────────────────────
         for vr in variance_records:
             rec = vr.record
             if not vr.in_db:
@@ -797,10 +842,10 @@ class CountImporter:
                 continue
             try:
                 ok = self.db.update_quantity_from_count(
-                    key         = rec.item_key,
-                    new_qty     = vr.new_qty,
-                    import_id   = meta.import_id,
-                    changed_by  = meta.imported_by,
+                    key        = rec.item_key,
+                    new_qty    = vr.new_qty,
+                    import_id  = meta.import_id,
+                    changed_by = meta.imported_by,
                 )
                 if ok:
                     results['items_updated'] += 1
@@ -810,48 +855,48 @@ class CountImporter:
                 results['errors'].append(f"{rec.item_key}: {e}")
                 results['items_skipped'] += 1
 
-        # ── Pass 2: save import metadata ────────────────────────────────────
+        # ── Pass 3: save import metadata ────────────────────────────────────
         try:
             self.db.log_count_import(
-                import_id         = meta.import_id,
-                source_file       = meta.source_file,
-                file_format       = meta.file_format,
-                data_layout       = meta.data_layout,
-                count_type        = meta.count_type,
-                count_date        = meta.count_date,
-                cost_center       = meta.cost_center,
-                imported_by       = meta.imported_by,
-                total_items       = len(variance_records),
-                items_changed     = results['items_updated'],
-                items_flagged     = results['items_flagged'],
-                total_prev_value  = results['total_prev_value'],
-                total_new_value   = results['total_new_value'],
-                variance_value    = results['total_variance_value'],
+                import_id        = meta.import_id,
+                source_file      = meta.source_file,
+                file_format      = meta.file_format,
+                data_layout      = meta.data_layout,
+                count_type       = meta.count_type,
+                count_date       = meta.count_date,
+                cost_center      = meta.cost_center,
+                imported_by      = meta.imported_by,
+                total_items      = len(variance_records),
+                items_changed    = results['items_updated'],
+                items_flagged    = results['items_flagged'],
+                total_prev_value = results['total_prev_value'],
+                total_new_value  = results['total_new_value'],
+                variance_value   = results['total_variance_value'],
             )
         except Exception as e:
             results['errors'].append(f"Import log write failed: {e}")
 
-        # ── Pass 3: save variance detail ────────────────────────────────────
+        # ── Pass 4: save variance detail ─────────────────────────────────────
         try:
             detail_rows = []
             for vr in variance_records:
                 rec = vr.record
                 detail_rows.append({
-                    'import_id':       meta.import_id,
-                    'location':        rec.location,
-                    'seq':             rec.seq,
-                    'item_key':        rec.item_key,
-                    'item_description':rec.item_description,
-                    'pack_type':       rec.pack_type,
-                    'prev_qty_each':   vr.db_qty,
-                    'new_qty_each':    vr.new_qty,
-                    'count_qty_case':  rec.count_qty_case,
-                    'count_qty_each':  rec.count_qty_each,
-                    'price_each':      rec.price_each,
-                    'variance_each':   vr.variance_each,
-                    'variance_value':  vr.variance_value,
-                    'is_flagged':      vr.is_flagged,
-                    'flag_reason':     vr.flag_reason,
+                    'import_id':        meta.import_id,
+                    'location':         rec.location,
+                    'seq':              rec.seq,
+                    'item_key':         rec.item_key,
+                    'item_description': rec.item_description,
+                    'pack_type':        rec.pack_type,
+                    'prev_qty_each':    vr.db_qty,
+                    'new_qty_each':     vr.new_qty,
+                    'count_qty_case':   rec.count_qty_case,
+                    'count_qty_each':   rec.count_qty_each,
+                    'price_each':       rec.price_each,
+                    'variance_each':    vr.variance_each,
+                    'variance_value':   vr.variance_value,
+                    'is_flagged':       vr.is_flagged,
+                    'flag_reason':      vr.flag_reason,
                 })
             self.db.save_count_variance_records(detail_rows)
         except Exception as e:

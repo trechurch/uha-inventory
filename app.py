@@ -1089,25 +1089,40 @@ def page_count_import():
     st.markdown("---")
     st.subheader("Step 4 — Commit Count")
 
-    items_to_write = [v for v in variance if v.in_db]
-    skip_count     = len(variance) - len(items_to_write)
+    items_in_db   = [v for v in variance if v.in_db]
+    items_missing = [v for v in variance if not v.in_db]
 
-    if skip_count:
-        st.warning(
-            f"⚠️ {skip_count} item(s) not found in the database will be skipped. "
-            "Run a vendor import first to add them, or manually create them in Inventory."
+    if items_missing:
+        st.info(
+            f"ℹ️ **{len(items_missing)} item(s) not currently in the database.** "
+            f"Use the option below to add them automatically from the count data, "
+            f"or skip them and add manually later."
         )
+        add_missing = st.toggle(
+            f"➕ Add {len(items_missing)} unmatched item(s) to the database from this count",
+            value=True,
+            help=(
+                "Creates a new DB record for each unmatched item using the description, "
+                "pack type, and price from the count file. GL code, vendor, and other "
+                "details can be filled in later via the Inventory page or a vendor import."
+            ),
+        )
+    else:
+        add_missing = False
+
+    items_to_write = len(variance) if add_missing else len(items_in_db)
+    items_new_note = f" ({len(items_missing)} new + {len(items_in_db)} updates)" if add_missing and items_missing else ""
 
     confirm = st.checkbox(
-        f"I confirm: commit {len(items_to_write)} quantity update(s) "
+        f"I confirm: commit {items_to_write} item(s){items_new_note} "
         f"from {count_type} count dated {count_date}",
         key="count_confirm",
     )
 
     commit_btn = st.button(
-        f"✅ Commit Count — {len(items_to_write)} items",
+        f"✅ Commit Count — {items_to_write} items{items_new_note}",
         type="primary",
-        disabled=not confirm or len(items_to_write) == 0,
+        disabled=not confirm or items_to_write == 0,
     )
 
     if commit_btn:
@@ -1120,7 +1135,7 @@ def page_count_import():
             imported_by  = "user",
         )
         with st.spinner("Writing count to database..."):
-            results = ci.execute_count_import(variance, meta)
+            results = ci.execute_count_import(variance, meta, add_missing=add_missing)
         st.session_state.count_results   = results
         st.session_state.count_committed = True
         st.rerun()
@@ -1132,11 +1147,12 @@ def _render_count_results():
         return
 
     st.success("✅ Count import committed successfully!")
-    rc1, rc2, rc3, rc4 = st.columns(4)
-    rc1.metric("Import ID",     r.get("import_id", ""))
-    rc2.metric("Items Updated", r.get("items_updated", 0))
-    rc3.metric("Items Skipped", r.get("items_skipped", 0))
-    rc4.metric("🚩 Flagged",    r.get("items_flagged", 0))
+    rc1, rc2, rc3, rc4, rc5 = st.columns(5)
+    rc1.metric("Import ID",      r.get("import_id", ""))
+    rc2.metric("➕ Items Created", r.get("items_created", 0))
+    rc3.metric("🔄 Items Updated", r.get("items_updated", 0))
+    rc4.metric("⏭️ Items Skipped", r.get("items_skipped", 0))
+    rc5.metric("🚩 Flagged",      r.get("items_flagged", 0))
 
     net = r.get("total_new_value", 0) - r.get("total_prev_value", 0)
     vc1, vc2, vc3 = st.columns(3)
