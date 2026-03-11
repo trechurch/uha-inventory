@@ -17,7 +17,16 @@ from contextlib import contextmanager
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  CONNECTION HELPERS
+#  Uses a ThreadedConnectionPool so every DB call reuses an existing TCP
+#  connection instead of opening a new one.  maxconn=3 keeps us inside
+#  Supabase's direct-connection limit on free/pro tiers.
 # ──────────────────────────────────────────────────────────────────────────────
+
+from psycopg2.pool import ThreadedConnectionPool
+
+_pool: Optional["ThreadedConnectionPool"] = None
+_pool_dsn: str = ""
+
 
 def get_connection_string() -> str:
     """Get DB URL from Streamlit secrets or environment variable."""
@@ -28,10 +37,30 @@ def get_connection_string() -> str:
         return os.environ.get("SUPABASE_DB_URL", "")
 
 
+def _get_pool() -> "ThreadedConnectionPool":
+    """Return the module-level connection pool, creating it if needed."""
+    global _pool, _pool_dsn
+    dsn = get_connection_string()
+    if _pool is None or _pool.closed or dsn != _pool_dsn:
+        if _pool and not _pool.closed:
+            try:
+                _pool.closeall()
+            except Exception:
+                pass
+        _pool     = ThreadedConnectionPool(minconn=1, maxconn=3, dsn=dsn)
+        _pool_dsn = dsn
+    return _pool
+
+
 @contextmanager
 def get_conn():
-    """Context manager — opens and closes a connection per operation."""
-    conn = psycopg2.connect(get_connection_string())
+    """
+    Context manager — checks out a connection from the pool, commits or
+    rolls back, then returns it.  Never opens a fresh TCP connection if
+    one is already available.
+    """
+    pool = _get_pool()
+    conn = pool.getconn()
     try:
         yield conn
         conn.commit()
@@ -39,7 +68,7 @@ def get_conn():
         conn.rollback()
         raise
     finally:
-        conn.close()
+        pool.putconn(conn)
 
 # ── end of connection helpers ─────────────────────────────────────────────────
 
@@ -643,6 +672,29 @@ class InventoryDatabase:
             return [dict(r) for r in cur.fetchall()]
 
     # ── end of count import readers ───────────────────────────────────────────
+
+
+    # ──────────────────────────────────────────────────────────────────────────
+    #  BULK ITEM FETCH  —  single query for multiple keys (used by count variance)
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def get_items_bulk(self, keys: List[str]) -> Dict[str, Dict]:
+        """
+        Fetch multiple items by key in a single query.
+        Returns {item_key: item_dict}.  Missing keys simply won't appear
+        in the result — callers treat absence as 'not in DB'.
+        """
+        if not keys:
+            return {}
+        with get_conn() as conn:
+            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cur.execute(
+                "SELECT * FROM items WHERE key = ANY(%s)",
+                (list(keys),)
+            )
+            return {row["key"]: dict(row) for row in cur.fetchall()}
+
+    # ── end of bulk item fetch ────────────────────────────────────────────────
 
 
     # ──────────────────────────────────────────────────────────────────────────

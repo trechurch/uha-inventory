@@ -679,6 +679,7 @@ class CountImporter:
 
     # ──────────────────────────────────────────────────────────────────────────
     #  VARIANCE CALCULATION  —  compare records vs. database, NO writes
+    #  One bulk DB query replaces the previous per-item query loop.
     # ──────────────────────────────────────────────────────────────────────────
 
     def calculate_variance(
@@ -689,42 +690,50 @@ class CountImporter:
     ) -> List[VarianceRecord]:
         """
         Diff every CountRecord against the current DB qty.
+        Fetches ALL required items in a single query, then diffs in memory.
         Returns a list of VarianceRecord objects — no DB writes.
         """
+        if not records:
+            return []
+
+        # ── Single bulk fetch ────────────────────────────────────────────────
+        all_keys = list({r.item_key for r in records})
+        db_map   = self.db.get_items_bulk(all_keys)   # {key: item_dict}
+
+        # ── In-memory diff ───────────────────────────────────────────────────
         variance_list: List[VarianceRecord] = []
 
         for rec in records:
-            db_item      = self.db.get_item(rec.item_key)
-            in_db        = db_item is not None
-            db_qty       = float(db_item.get('quantity_on_hand') or 0) if in_db else 0.0
-            db_price_ea  = float(db_item.get('cost') or 0)             if in_db else rec.price_each
+            db_item     = db_map.get(rec.item_key)
+            in_db       = db_item is not None
+            db_qty      = float(db_item.get("quantity_on_hand") or 0) if in_db else 0.0
+            db_price_ea = float(db_item.get("cost") or 0)             if in_db else rec.price_each
 
-            # The "new" quantity is EA count (single units)
-            # If the item has a known conv_ratio, factor in case count
+            # Effective new qty — fold case count in via conv_ratio when known
             new_qty = rec.count_qty_each
-            if in_db and db_item.get('conv_ratio'):
+            if in_db and db_item.get("conv_ratio"):
                 try:
-                    conv = float(db_item['conv_ratio'])
+                    conv = float(db_item["conv_ratio"])
                     if conv > 0:
                         new_qty += rec.count_qty_case * conv
                 except (ValueError, TypeError):
-                    new_qty += rec.count_qty_case  # best-effort
+                    new_qty += rec.count_qty_case
 
-            variance_each  = new_qty - db_qty
-            effective_price = rec.price_each if rec.price_each > 0 else db_price_ea
-            variance_value  = variance_each * effective_price
+            variance_each   = new_qty - db_qty
+            eff_price       = rec.price_each if rec.price_each > 0 else db_price_ea
+            variance_value  = variance_each * eff_price
 
             is_flagged  = False
             flag_reason = ""
-            if abs(variance_each) > flag_each_threshold:
+            if not in_db:
+                is_flagged  = True
+                flag_reason = "Item not found in database"
+            elif abs(variance_each) > flag_each_threshold:
                 is_flagged  = True
                 flag_reason = f"Unit variance {variance_each:+.1f} exceeds threshold {flag_each_threshold}"
             elif abs(variance_value) > flag_value_threshold:
                 is_flagged  = True
                 flag_reason = f"Value variance ${variance_value:+.2f} exceeds threshold ${flag_value_threshold:.2f}"
-            elif not in_db:
-                is_flagged  = True
-                flag_reason = "Item not found in database"
 
             variance_list.append(VarianceRecord(
                 record          = rec,

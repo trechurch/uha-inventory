@@ -10,6 +10,7 @@
 
 import re
 import io
+import time
 import tempfile
 import os
 from datetime import datetime
@@ -948,9 +949,12 @@ def page_count_import():
         st.session_state.count_results    = None
 
         with st.spinner("Parsing file..."):
+            t0 = time.perf_counter()
             records, fmt = ci.parse(uploaded.name, content)
+            parse_elapsed = time.perf_counter() - t0
         st.session_state.count_records = records
         st.session_state.count_fmt     = fmt
+        st.session_state["parse_elapsed"] = parse_elapsed
 
         if ci.errors:
             for e in ci.errors:
@@ -974,7 +978,11 @@ def page_count_import():
     fi3.metric("Items",     fmt.get("record_count", len(records)))
     fi4.metric("Locations", len(fmt.get("locations", [])))
 
-    st.caption(f"📄 {uploaded.name}  ·  Detected: {fmt.get('description', '')}")
+    st.caption(
+        f"📄 {uploaded.name}  ·  Detected: {fmt.get('description', '')}"
+        + (f"  ·  ⏱ parsed in {st.session_state.get('parse_elapsed', 0):.2f}s"
+           if st.session_state.get('parse_elapsed') else "")
+    )
 
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -1014,13 +1022,16 @@ def page_count_import():
     if (st.session_state.count_variance is None or
             st.session_state.get("_calc_key") != calc_key):
         with st.spinner("Calculating variance..."):
+            t0 = time.perf_counter()
             variance = ci.calculate_variance(
                 work_records,
                 flag_each_threshold  = int(flag_each),
                 flag_value_threshold = float(flag_value),
             )
-        st.session_state.count_variance  = variance
-        st.session_state["_calc_key"]    = calc_key
+            var_elapsed = time.perf_counter() - t0
+        st.session_state.count_variance      = variance
+        st.session_state["_calc_key"]        = calc_key
+        st.session_state["variance_elapsed"] = var_elapsed
     else:
         variance = st.session_state.count_variance
 
@@ -1033,6 +1044,14 @@ def page_count_import():
     vc2.metric("🚩 Flagged",      len(flagged),   delta=None)
     vc3.metric("❓ Not in DB",    len(not_in_db))
     vc4.metric("Net Value Δ",     f"${net_value:+,.2f}")
+
+    timing_parts = []
+    if st.session_state.get("parse_elapsed"):
+        timing_parts.append(f"⏱ parse {st.session_state['parse_elapsed']:.2f}s")
+    if st.session_state.get("variance_elapsed"):
+        timing_parts.append(f"variance diff {st.session_state['variance_elapsed']:.2f}s")
+    if timing_parts:
+        st.caption("  ·  ".join(timing_parts))
 
     tab_flag, tab_all = st.tabs([
         f"🚩 Flagged ({len(flagged)})",
@@ -1156,8 +1175,17 @@ def _render_count_results():
 
 
 def _render_count_history():
-    db       = get_db()
-    imports  = db.get_count_imports(limit=10)
+    db = get_db()
+    try:
+        imports = db.get_count_imports(limit=10)
+    except Exception as e:
+        st.info(
+            "Count import history is not available yet — the count tables may still be "
+            "initializing. Try rebooting the app from the Streamlit Cloud dashboard, "
+            "or upload a file above to trigger table creation."
+        )
+        st.caption(f"Detail: {e}")
+        return
     if not imports:
         st.info("No count imports on record yet. Upload a count file above to get started.")
         return
