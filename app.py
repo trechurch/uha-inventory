@@ -42,6 +42,7 @@ st.set_page_config(
 from database import InventoryDatabase
 from importer import InventoryImporter
 from gl_manager import GLCodeManager
+from count_importer import CountImporter, CountImportMeta
 import onedrive_connector as od
 
 # ── end of local module imports ───────────────────────────────────────────────
@@ -60,6 +61,9 @@ def get_importer():
 
 def get_gl():
     return GLCodeManager(get_db())
+
+def get_count_importer():
+    return CountImporter(get_db())
 
 # ── end of cached resource helpers ───────────────────────────────────────────
 
@@ -889,6 +893,311 @@ def page_export():
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+#  PAGE — COUNT IMPORT  (myOrders CSV / XLSX / PDF count exports)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _init_count_state():
+    defaults = {
+        "count_records":    None,   # List[CountRecord] after parse
+        "count_variance":   None,   # List[VarianceRecord] after diff
+        "count_fmt":        None,   # format_info dict
+        "count_committed":  False,
+        "count_results":    None,
+        "count_file_name":  "",
+        "count_file_bytes": None,
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+
+def page_count_import():
+    from count_importer import CountImportMeta
+
+    st.title("📋 Count Import")
+    st.caption("Import on-hand counts from myOrders CSV, XLSX, or PDF exports.")
+    _init_count_state()
+    ci = get_count_importer()
+
+    # ── RESULTS SCREEN (after commit) ────────────────────────────────────────
+    if st.session_state.count_committed and st.session_state.count_results:
+        _render_count_results()
+        return
+
+    # ── STEP 1 — UPLOAD ──────────────────────────────────────────────────────
+    st.subheader("Step 1 — Upload Count File")
+    uploaded = st.file_uploader(
+        "Drop myOrders count export here (CSV, XLSX, or PDF)",
+        type=["csv", "xlsx", "pdf"],
+        label_visibility="collapsed",
+    )
+
+    if not uploaded:
+        # Show prior import history
+        _render_count_history()
+        return
+
+    # Re-parse only when a new file is uploaded
+    if uploaded.name != st.session_state.count_file_name:
+        content = uploaded.read()
+        st.session_state.count_file_bytes = content
+        st.session_state.count_file_name  = uploaded.name
+        st.session_state.count_records    = None
+        st.session_state.count_variance   = None
+        st.session_state.count_committed  = False
+        st.session_state.count_results    = None
+
+        with st.spinner("Parsing file..."):
+            records, fmt = ci.parse(uploaded.name, content)
+        st.session_state.count_records = records
+        st.session_state.count_fmt     = fmt
+
+        if ci.errors:
+            for e in ci.errors:
+                st.error(e)
+            return
+
+    records = st.session_state.count_records
+    fmt     = st.session_state.count_fmt or {}
+
+    if not records:
+        st.warning("No records found in this file. Check that it is a valid count export.")
+        return
+
+    # ── STEP 2 — FILE SUMMARY + OPTIONS ──────────────────────────────────────
+    st.markdown("---")
+    st.subheader("Step 2 — Confirm Details")
+
+    fi1, fi2, fi3, fi4 = st.columns(4)
+    fi1.metric("Format",    fmt.get("ext", "?").upper())
+    fi2.metric("Layout",    fmt.get("layout", "?").capitalize())
+    fi3.metric("Items",     fmt.get("record_count", len(records)))
+    fi4.metric("Locations", len(fmt.get("locations", [])))
+
+    st.caption(f"📄 {uploaded.name}  ·  Detected: {fmt.get('description', '')}")
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        count_date = st.date_input(
+            "Count Date",
+            value=datetime.now().date(),
+        )
+    with col2:
+        count_type = st.radio(
+            "Count Type",
+            ["complete", "partial"],
+            horizontal=True,
+            help="Complete: overwrites all qty. Partial: updates listed items only.",
+        )
+    with col3:
+        location_filter = st.multiselect(
+            "Limit to locations (optional)",
+            options=fmt.get("locations", []),
+            placeholder="All locations",
+        )
+    with col1:
+        flag_each  = st.number_input("Flag threshold — units", value=24, min_value=1)
+    with col2:
+        flag_value = st.number_input("Flag threshold — value ($)", value=50.0, min_value=0.0, format="%.2f")
+
+    # Filter records if location scope selected
+    work_records = records
+    if location_filter:
+        work_records = [r for r in records if r.location in location_filter]
+
+    # ── STEP 3 — VARIANCE PREVIEW ─────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("Step 3 — Variance Preview")
+
+    # Recalculate when options change
+    calc_key = f"{uploaded.name}|{flag_each}|{flag_value}|{'|'.join(sorted(location_filter))}"
+    if (st.session_state.count_variance is None or
+            st.session_state.get("_calc_key") != calc_key):
+        with st.spinner("Calculating variance..."):
+            variance = ci.calculate_variance(
+                work_records,
+                flag_each_threshold  = int(flag_each),
+                flag_value_threshold = float(flag_value),
+            )
+        st.session_state.count_variance  = variance
+        st.session_state["_calc_key"]    = calc_key
+    else:
+        variance = st.session_state.count_variance
+
+    flagged    = [v for v in variance if v.is_flagged]
+    not_in_db  = [v for v in variance if not v.in_db]
+    net_value  = sum(v.variance_value for v in variance)
+
+    vc1, vc2, vc3, vc4 = st.columns(4)
+    vc1.metric("Total Items",     len(variance))
+    vc2.metric("🚩 Flagged",      len(flagged),   delta=None)
+    vc3.metric("❓ Not in DB",    len(not_in_db))
+    vc4.metric("Net Value Δ",     f"${net_value:+,.2f}")
+
+    tab_flag, tab_all = st.tabs([
+        f"🚩 Flagged ({len(flagged)})",
+        f"📋 All Items ({len(variance)})",
+    ])
+
+    def _variance_df(rows):
+        return pd.DataFrame([{
+            "Location":      v.record.location,
+            "Description":   v.record.item_description,
+            "Pack Type":     v.record.pack_type,
+            "Prev Qty":      round(v.db_qty, 2),
+            "New Qty":       round(v.new_qty, 2),
+            "Variance":      f"{v.variance_each:+.2f}",
+            "Δ Value":       f"${v.variance_value:+,.2f}",
+            "In DB":         "✅" if v.in_db else "❌",
+            "Flag":          "🚩 " + v.flag_reason if v.is_flagged else "",
+        } for v in rows])
+
+    with tab_flag:
+        if flagged:
+            st.dataframe(_variance_df(flagged), use_container_width=True, hide_index=True)
+        else:
+            st.success("No items exceed variance thresholds.")
+
+    with tab_all:
+        loc_opts = ["All"] + sorted(set(v.record.location for v in variance))
+        sel_loc  = st.selectbox("Filter by location", loc_opts, key="var_loc_filter")
+        show_rows = variance if sel_loc == "All" else [
+            v for v in variance if v.record.location == sel_loc
+        ]
+        st.dataframe(_variance_df(show_rows), use_container_width=True, hide_index=True)
+
+    # ── STEP 4 — COMMIT ───────────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("Step 4 — Commit Count")
+
+    items_to_write = [v for v in variance if v.in_db]
+    skip_count     = len(variance) - len(items_to_write)
+
+    if skip_count:
+        st.warning(
+            f"⚠️ {skip_count} item(s) not found in the database will be skipped. "
+            "Run a vendor import first to add them, or manually create them in Inventory."
+        )
+
+    confirm = st.checkbox(
+        f"I confirm: commit {len(items_to_write)} quantity update(s) "
+        f"from {count_type} count dated {count_date}",
+        key="count_confirm",
+    )
+
+    commit_btn = st.button(
+        f"✅ Commit Count — {len(items_to_write)} items",
+        type="primary",
+        disabled=not confirm or len(items_to_write) == 0,
+    )
+
+    if commit_btn:
+        meta = CountImportMeta(
+            source_file  = uploaded.name,
+            file_format  = fmt.get("ext", ""),
+            data_layout  = fmt.get("layout", ""),
+            count_type   = count_type,
+            count_date   = str(count_date),
+            imported_by  = "user",
+        )
+        with st.spinner("Writing count to database..."):
+            results = ci.execute_count_import(variance, meta)
+        st.session_state.count_results   = results
+        st.session_state.count_committed = True
+        st.rerun()
+
+
+def _render_count_results():
+    r = st.session_state.count_results
+    if not r:
+        return
+
+    st.success("✅ Count import committed successfully!")
+    rc1, rc2, rc3, rc4 = st.columns(4)
+    rc1.metric("Import ID",     r.get("import_id", ""))
+    rc2.metric("Items Updated", r.get("items_updated", 0))
+    rc3.metric("Items Skipped", r.get("items_skipped", 0))
+    rc4.metric("🚩 Flagged",    r.get("items_flagged", 0))
+
+    net = r.get("total_new_value", 0) - r.get("total_prev_value", 0)
+    vc1, vc2, vc3 = st.columns(3)
+    vc1.metric("Prev Inventory Value", f"${r.get('total_prev_value', 0):,.2f}")
+    vc2.metric("New Inventory Value",  f"${r.get('total_new_value', 0):,.2f}")
+    vc3.metric("Net Δ Value",          f"${net:+,.2f}")
+
+    if r.get("errors"):
+        with st.expander(f"⚠️ {len(r['errors'])} error(s)"):
+            for e in r["errors"]:
+                st.caption(e)
+
+    # Variance detail from DB
+    db = get_db()
+    detail = db.get_count_variance_detail(r["import_id"])
+    if detail:
+        st.markdown("---")
+        st.subheader("Variance Detail")
+        flagged_only = st.checkbox("Show flagged only", value=True)
+        rows = [d for d in detail if d["is_flagged"]] if flagged_only else detail
+        if rows:
+            st.dataframe(pd.DataFrame(rows)[[
+                "location", "item_description", "pack_type",
+                "prev_qty_each", "new_qty_each", "variance_each",
+                "variance_value", "is_flagged", "flag_reason",
+            ]], use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+    if st.button("📋 Import Another Count"):
+        for k in ("count_records", "count_variance", "count_fmt",
+                  "count_committed", "count_results",
+                  "count_file_name", "count_file_bytes", "_calc_key"):
+            st.session_state[k] = None if k not in (
+                "count_committed",) else False
+        st.rerun()
+
+
+def _render_count_history():
+    db       = get_db()
+    imports  = db.get_count_imports(limit=10)
+    if not imports:
+        st.info("No count imports on record yet. Upload a count file above to get started.")
+        return
+
+    st.markdown("---")
+    st.subheader("Recent Count Imports")
+    df = pd.DataFrame(imports)[[
+        "count_date", "source_file", "cost_center", "count_type",
+        "total_items", "items_changed", "items_flagged",
+        "total_prev_value", "total_new_value", "variance_value", "imported_by",
+    ]]
+    df["total_prev_value"] = df["total_prev_value"].apply(lambda x: f"${float(x or 0):,.2f}")
+    df["total_new_value"]  = df["total_new_value"].apply(lambda x: f"${float(x or 0):,.2f}")
+    df["variance_value"]   = df["variance_value"].apply(lambda x: f"${float(x or 0):+,.2f}")
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    # Drill-down into a specific import
+    import_ids = [i["import_id"] for i in imports]
+    sel_id = st.selectbox(
+        "View variance detail for import",
+        ["— select —"] + import_ids,
+        key="count_hist_sel",
+    )
+    if sel_id and sel_id != "— select —":
+        detail      = db.get_count_variance_detail(sel_id)
+        flagged_det = [d for d in detail if d["is_flagged"]]
+        st.caption(f"{len(detail)} items · {len(flagged_det)} flagged")
+        if detail:
+            flagged_only = st.checkbox("Flagged only", value=bool(flagged_det), key="hist_flag_chk")
+            rows = flagged_det if flagged_only else detail
+            st.dataframe(pd.DataFrame(rows)[[
+                "location", "item_description", "pack_type",
+                "prev_qty_each", "new_qty_each", "variance_each",
+                "variance_value", "is_flagged", "flag_reason",
+            ]], use_container_width=True, hide_index=True)
+
+# ── end of page — count import ────────────────────────────────────────────────
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 #  MAIN NAV
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -901,6 +1210,7 @@ def main():
             "🏠 Dashboard",
             "📦 Inventory",
             "📥 Import",
+            "📋 Count Import",
             "🏷️ GL Codes",
             "📜 History",
             "📤 Export",
@@ -908,12 +1218,13 @@ def main():
 
     onedrive_auth_sidebar()
 
-    if   page == "🏠 Dashboard": page_dashboard()
-    elif page == "📦 Inventory": page_inventory()
-    elif page == "📥 Import":    page_import()
-    elif page == "🏷️ GL Codes":  page_gl_codes()
-    elif page == "📜 History":   page_history()
-    elif page == "📤 Export":    page_export()
+    if   page == "🏠 Dashboard":    page_dashboard()
+    elif page == "📦 Inventory":    page_inventory()
+    elif page == "📥 Import":       page_import()
+    elif page == "📋 Count Import": page_count_import()
+    elif page == "🏷️ GL Codes":     page_gl_codes()
+    elif page == "📜 History":      page_history()
+    elif page == "📤 Export":       page_export()
 
 
 if __name__ == "__main__":

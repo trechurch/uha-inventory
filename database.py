@@ -57,7 +57,7 @@ class InventoryDatabase:
         self.create_tables()
 
     # ──────────────────────────────────────────────────────────────────────────
-    #  SCHEMA — create tables and indexes if they don't exist
+    #  SCHEMA
     # ──────────────────────────────────────────────────────────────────────────
 
     def create_tables(self):
@@ -134,11 +134,52 @@ class InventoryDatabase:
                     file_hash       TEXT
                 );
 
+                CREATE TABLE IF NOT EXISTS count_imports (
+                    import_id           TEXT PRIMARY KEY,
+                    source_file         TEXT,
+                    file_format         TEXT,
+                    data_layout         TEXT,
+                    count_type          TEXT DEFAULT 'complete',
+                    count_date          DATE,
+                    cost_center         TEXT,
+                    imported_by         TEXT,
+                    imported_at         TIMESTAMPTZ DEFAULT NOW(),
+                    total_items         INTEGER DEFAULT 0,
+                    items_changed       INTEGER DEFAULT 0,
+                    items_flagged       INTEGER DEFAULT 0,
+                    total_prev_value    NUMERIC(12,2) DEFAULT 0,
+                    total_new_value     NUMERIC(12,2) DEFAULT 0,
+                    variance_value      NUMERIC(12,2) DEFAULT 0,
+                    notes               TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS count_variance_detail (
+                    id               SERIAL PRIMARY KEY,
+                    import_id        TEXT REFERENCES count_imports(import_id),
+                    location         TEXT,
+                    seq              TEXT,
+                    item_key         TEXT,
+                    item_description TEXT,
+                    pack_type        TEXT,
+                    prev_qty_each    NUMERIC(10,4) DEFAULT 0,
+                    new_qty_each     NUMERIC(10,4) DEFAULT 0,
+                    count_qty_case   NUMERIC(10,4) DEFAULT 0,
+                    count_qty_each   NUMERIC(10,4) DEFAULT 0,
+                    price_each       NUMERIC(10,4) DEFAULT 0,
+                    variance_each    NUMERIC(10,4) DEFAULT 0,
+                    variance_value   NUMERIC(10,2) DEFAULT 0,
+                    is_flagged       BOOLEAN DEFAULT FALSE,
+                    flag_reason      TEXT
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_items_description ON items(description);
                 CREATE INDEX IF NOT EXISTS idx_items_gl_code     ON items(gl_code);
                 CREATE INDEX IF NOT EXISTS idx_items_vendor      ON items(vendor);
                 CREATE INDEX IF NOT EXISTS idx_history_item_key  ON item_history(item_key);
                 CREATE INDEX IF NOT EXISTS idx_import_log_hash   ON import_log(file_hash);
+                CREATE INDEX IF NOT EXISTS idx_count_imports_date     ON count_imports(count_date DESC);
+                CREATE INDEX IF NOT EXISTS idx_count_variance_import  ON count_variance_detail(import_id);
+                CREATE INDEX IF NOT EXISTS idx_count_variance_item    ON count_variance_detail(item_key);
             """)
 
     # ── end of schema ─────────────────────────────────────────────────────────
@@ -176,10 +217,6 @@ class InventoryDatabase:
 
     def check_duplicate_import(self, filename: str, file_size: int,
                                 file_hash: str = None) -> Optional[Dict]:
-        """
-        Returns the previous import record if this file looks like a duplicate,
-        otherwise returns None.  Matches on hash (preferred) or filename+size.
-        """
         with get_conn() as conn:
             cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
             if file_hash:
@@ -200,7 +237,7 @@ class InventoryDatabase:
 
 
     # ──────────────────────────────────────────────────────────────────────────
-    #  CRUD — add, upsert, get, list, search, count, delete
+    #  CRUD
     # ──────────────────────────────────────────────────────────────────────────
 
     def add_item(self, item_data: Dict[str, Any],
@@ -457,6 +494,155 @@ class InventoryDatabase:
             return [dict(r) for r in cur.fetchall()]
 
     # ── end of history readers ────────────────────────────────────────────────
+
+
+    # ──────────────────────────────────────────────────────────────────────────
+    #  COUNT IMPORT — quantity update
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def update_quantity_from_count(self, key: str, new_qty: float,
+                                   import_id: str,
+                                   changed_by: str = "count_import") -> bool:
+        """Set quantity_on_hand to new_qty and write to item_history."""
+        return self._apply_update(
+            key,
+            {
+                "quantity_on_hand": new_qty,
+                "last_updated":     datetime.utcnow(),
+                "status_tag":       "📦 Count Updated",
+            },
+            change_source   = "count_import",
+            source_document = import_id,
+            changed_by      = changed_by,
+        )
+
+    # ── end of count import quantity update ───────────────────────────────────
+
+
+    # ──────────────────────────────────────────────────────────────────────────
+    #  COUNT IMPORT LOG
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def log_count_import(self, import_id: str, source_file: str,
+                         file_format: str, data_layout: str,
+                         count_type: str, count_date: str,
+                         cost_center: str, imported_by: str,
+                         total_items: int, items_changed: int,
+                         items_flagged: int,
+                         total_prev_value: float, total_new_value: float,
+                         variance_value: float, notes: str = None):
+        with get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO count_imports (
+                    import_id, source_file, file_format, data_layout,
+                    count_type, count_date, cost_center, imported_by,
+                    total_items, items_changed, items_flagged,
+                    total_prev_value, total_new_value, variance_value, notes
+                ) VALUES (
+                    %s, %s, %s, %s,
+                    %s, %s, %s, %s,
+                    %s, %s, %s,
+                    %s, %s, %s, %s
+                )
+            """, (
+                import_id, source_file, file_format, data_layout,
+                count_type, count_date, cost_center, imported_by,
+                total_items, items_changed, items_flagged,
+                total_prev_value, total_new_value, variance_value, notes,
+            ))
+
+    # ── end of count import log ───────────────────────────────────────────────
+
+
+    # ──────────────────────────────────────────────────────────────────────────
+    #  COUNT VARIANCE DETAIL — bulk insert
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def save_count_variance_records(self, rows: List[Dict]):
+        if not rows:
+            return
+        with get_conn() as conn:
+            cur = conn.cursor()
+            psycopg2.extras.execute_batch(cur, """
+                INSERT INTO count_variance_detail (
+                    import_id, location, seq, item_key,
+                    item_description, pack_type,
+                    prev_qty_each, new_qty_each,
+                    count_qty_case, count_qty_each,
+                    price_each,
+                    variance_each, variance_value,
+                    is_flagged, flag_reason
+                ) VALUES (
+                    %(import_id)s, %(location)s, %(seq)s, %(item_key)s,
+                    %(item_description)s, %(pack_type)s,
+                    %(prev_qty_each)s, %(new_qty_each)s,
+                    %(count_qty_case)s, %(count_qty_each)s,
+                    %(price_each)s,
+                    %(variance_each)s, %(variance_value)s,
+                    %(is_flagged)s, %(flag_reason)s
+                )
+            """, rows)
+
+    # ── end of count variance detail ──────────────────────────────────────────
+
+
+    # ──────────────────────────────────────────────────────────────────────────
+    #  COUNT IMPORT READERS
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def get_count_imports(self, limit: int = 50) -> List[Dict]:
+        with get_conn() as conn:
+            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cur.execute("""
+                SELECT * FROM count_imports
+                ORDER BY imported_at DESC
+                LIMIT %s
+            """, (limit,))
+            return [dict(r) for r in cur.fetchall()]
+
+    def get_count_variance_detail(self, import_id: str,
+                                  flagged_only: bool = False,
+                                  location: str = None) -> List[Dict]:
+        filters = ["import_id = %s"]
+        params  = [import_id]
+        if flagged_only:
+            filters.append("is_flagged = TRUE")
+        if location:
+            filters.append("location = %s")
+            params.append(location)
+        where = " AND ".join(filters)
+        with get_conn() as conn:
+            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cur.execute(f"""
+                SELECT * FROM count_variance_detail
+                WHERE {where}
+                ORDER BY ABS(variance_value) DESC
+            """, params)
+            return [dict(r) for r in cur.fetchall()]
+
+    def get_item_count_trend(self, item_key: str, limit: int = 20) -> List[Dict]:
+        with get_conn() as conn:
+            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cur.execute("""
+                SELECT
+                    ci.count_date,
+                    ci.source_file,
+                    vd.location,
+                    vd.prev_qty_each,
+                    vd.new_qty_each,
+                    vd.variance_each,
+                    vd.variance_value,
+                    vd.is_flagged
+                FROM count_variance_detail vd
+                JOIN count_imports ci ON ci.import_id = vd.import_id
+                WHERE vd.item_key = %s
+                ORDER BY ci.count_date DESC
+                LIMIT %s
+            """, (item_key, limit))
+            return [dict(r) for r in cur.fetchall()]
+
+    # ── end of count import readers ───────────────────────────────────────────
 
 
     # ──────────────────────────────────────────────────────────────────────────
