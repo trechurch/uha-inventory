@@ -44,6 +44,7 @@ from database import InventoryDatabase
 from importer import InventoryImporter
 from gl_manager import GLCodeManager
 from count_importer import CountImporter, CountImportMeta
+from status_bar import status_bar
 import onedrive_connector as od
 
 # ── end of local module imports ───────────────────────────────────────────────
@@ -51,20 +52,38 @@ import onedrive_connector as od
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  CACHED RESOURCE HELPERS
+#  The version string is hashed from database.py's mtime so the cache busts
+#  automatically whenever database.py is updated in the repo.
 # ──────────────────────────────────────────────────────────────────────────────
 
-@st.cache_resource
-def get_db():
+import hashlib as _hashlib, pathlib as _pathlib
+
+def _db_version() -> str:
+    """Return a short hash of database.py so the cache key changes on update."""
+    try:
+        p = _pathlib.Path(__file__).parent / "database.py"
+        return _hashlib.md5(p.read_bytes()).hexdigest()[:8]
+    except Exception:
+        return "0"
+
+@st.cache_resource(hash_funcs={str: lambda s: s})
+def get_db(_ver: str = ""):
     return InventoryDatabase()
 
+def _get_db():
+    """Always passes the current database.py hash so stale instances are evicted."""
+    return get_db(_ver=_db_version())
+
 def get_importer():
-    return InventoryImporter(get_db())
+    return InventoryImporter(_get_db())
 
 def get_gl():
-    return GLCodeManager(get_db())
+    return GLCodeManager(_get_db())
 
 def get_count_importer():
-    return CountImporter(get_db())
+    return CountImporter(_get_db())
+
+# ── end of cached resource helpers ───────────────────────────────────────────
 
 # ── end of cached resource helpers ───────────────────────────────────────────
 
@@ -104,7 +123,7 @@ def onedrive_auth_sidebar():
 
 def page_dashboard():
     st.title("🏟️ UHA Inventory — Dashboard")
-    db = get_db()
+    db = _get_db()
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Total Items",  db.count_items("active"))
@@ -147,7 +166,7 @@ def page_dashboard():
 
 def page_inventory():
     st.title("📦 Inventory Items")
-    db = get_db()
+    db = _get_db()
 
     all_items = db.get_all_items("active")
 
@@ -714,7 +733,9 @@ def page_import():
 
             if uploaded_names != existing_names:
                 with st.spinner(f"Analyzing {len(uploaded)} file(s)..."):
+                    status_bar.start(f"Analyzing {len(uploaded)} invoice file(s)...")
                     _analyze_uploaded_files(uploaded, importer)
+                    status_bar.done("Analysis complete")
 
             if st.session_state.import_data:
                 _render_import_review(importer)
@@ -770,7 +791,7 @@ def page_import():
 
 def page_gl_codes():
     st.title("🏷️ GL Code Manager")
-    db = get_db()
+    db = _get_db()
     gl = get_gl()
 
     col1, col2 = st.columns(2)
@@ -821,7 +842,7 @@ def page_gl_codes():
 
 def page_history():
     st.title("📜 Change History")
-    db = get_db()
+    db = _get_db()
 
     key_input = st.text_input("Enter item key or search term")
     if key_input:
@@ -852,18 +873,48 @@ def page_history():
 #  PAGE — EXPORT
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _sanitize_for_excel(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Prepare a DataFrame for openpyxl export:
+    • Strip timezone from TIMESTAMPTZ columns (openpyxl rejects tz-aware datetimes)
+    • Convert dict/list/JSONB columns to JSON strings
+    • Convert any remaining non-serializable objects to str
+    """
+    df = df.copy()
+    for col in df.columns:
+        # Timezone-aware datetimes → naive UTC
+        if pd.api.types.is_datetime64_any_dtype(df[col]):
+            try:
+                df[col] = df[col].dt.tz_localize(None)
+            except Exception:
+                try:
+                    df[col] = df[col].dt.tz_convert(None)
+                except Exception:
+                    df[col] = df[col].astype(str)
+        else:
+            # Check for object columns containing dicts, lists, or mixed types
+            sample = df[col].dropna()
+            if not sample.empty and isinstance(sample.iloc[0], (dict, list)):
+                import json as _json
+                df[col] = df[col].apply(
+                    lambda v: _json.dumps(v) if isinstance(v, (dict, list)) else v
+                )
+    return df
+
+
 def page_export():
     st.title("📤 Export")
-    db = get_db()
+    db = _get_db()
 
     st.subheader("Export Full Inventory")
     items = db.get_all_items()
     if items:
-        df = pd.DataFrame(items)
+        df      = pd.DataFrame(items)
+        df_safe = _sanitize_for_excel(df)
 
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-            df.to_excel(writer, index=False, sheet_name="Inventory")
+            df_safe.to_excel(writer, index=False, sheet_name="Inventory")
         buffer.seek(0)
         st.download_button(
             "⬇️ Download as Excel",
@@ -885,7 +936,7 @@ def page_export():
         st.subheader("Save to OneDrive")
         if st.button("☁️ Export to OneDrive"):
             buffer = io.BytesIO()
-            df.to_excel(buffer, index=False)
+            df_safe.to_excel(buffer, index=False)
             filename = f"inventory_export_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
             od.archive_file(filename, buffer.getvalue(), subfolder="Exports")
             st.success(f"Saved {filename} to OneDrive Archives.")
@@ -950,8 +1001,10 @@ def page_count_import():
 
         with st.spinner("Parsing file..."):
             t0 = time.perf_counter()
+            status_bar.start(f"Parsing {uploaded.name}...")
             records, fmt = ci.parse(uploaded.name, content)
             parse_elapsed = time.perf_counter() - t0
+            status_bar.done(f"Parsed — {len(records)} records in {parse_elapsed:.2f}s")
         st.session_state.count_records = records
         st.session_state.count_fmt     = fmt
         st.session_state["parse_elapsed"] = parse_elapsed
@@ -1023,12 +1076,14 @@ def page_count_import():
             st.session_state.get("_calc_key") != calc_key):
         with st.spinner("Calculating variance..."):
             t0 = time.perf_counter()
+            status_bar.start(f"Bulk fetch — {len(work_records)} items...")
             variance = ci.calculate_variance(
                 work_records,
                 flag_each_threshold  = int(flag_each),
                 flag_value_threshold = float(flag_value),
             )
             var_elapsed = time.perf_counter() - t0
+            status_bar.done(f"Variance diff complete — {var_elapsed:.2f}s")
         st.session_state.count_variance      = variance
         st.session_state["_calc_key"]        = calc_key
         st.session_state["variance_elapsed"] = var_elapsed
@@ -1135,7 +1190,11 @@ def page_count_import():
             imported_by  = "user",
         )
         with st.spinner("Writing count to database..."):
+            status_bar.start(f"Committing {items_to_write} items...")
             results = ci.execute_count_import(variance, meta, add_missing=add_missing)
+            created = results.get("items_created", 0)
+            updated = results.get("items_updated", 0)
+            status_bar.done(f"Committed — {created} created · {updated} updated")
         st.session_state.count_results   = results
         st.session_state.count_committed = True
         st.rerun()
@@ -1166,7 +1225,7 @@ def _render_count_results():
                 st.caption(e)
 
     # Variance detail from DB
-    db = get_db()
+    db = _get_db()
     detail = db.get_count_variance_detail(r["import_id"])
     if detail:
         st.markdown("---")
@@ -1191,7 +1250,7 @@ def _render_count_results():
 
 
 def _render_count_history():
-    db = get_db()
+    db = _get_db()
     try:
         imports = db.get_count_imports(limit=10)
     except Exception as e:
@@ -1246,6 +1305,9 @@ def _render_count_history():
 # ──────────────────────────────────────────────────────────────────────────────
 
 def main():
+    # Inject the fixed footer bar — must be first Streamlit call in main
+    status_bar.inject()
+
     with st.sidebar:
         st.image("https://img.icons8.com/emoji/96/stadium.png", width=60)
         st.title("UHA Inventory")
@@ -1269,6 +1331,9 @@ def main():
     elif page == "🏷️ GL Codes":     page_gl_codes()
     elif page == "📜 History":      page_history()
     elif page == "📤 Export":       page_export()
+
+    # Return bar to idle pulse after every page render
+    status_bar.idle()
 
 
 if __name__ == "__main__":
