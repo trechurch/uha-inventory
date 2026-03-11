@@ -1352,7 +1352,8 @@ def main():
     menubar     = MenuBar(reg)
 
     # ── Inject top nav + footer ───────────────────────────────────────────────
-    status_bar.inject(menubar=menubar, sidebar_visible=sidebar_cfg.visible)
+    status_bar.inject_topnav(menubar, sidebar_visible=sidebar_cfg.visible)
+    status_bar.inject_footer()
 
     # ── Determine current page from query params ──────────────────────────────
     page = st.query_params.get("page", "dashboard")
