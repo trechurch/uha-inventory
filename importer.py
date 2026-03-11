@@ -1,20 +1,25 @@
-"""
-Inventory Importer - Canonical Version
-Key format: "ITEM NAME||PACKTYPE" (uppercase, double-pipe)
-Supports: Type B vendor invoice CSVs (B1 and B2 subtypes)
-PAC inventory PDFs handled via pac_importer.py (separate)
-"""
+# ──────────────────────────────────────────────────────────────────────────────
+#  importer.py  —  Inventory Importer  —  Canonical Version
+#  Key format : "ITEM NAME||PACKTYPE"  (uppercase, double-pipe)
+#  Supports   : Type B vendor invoice CSVs (B1 and B2 subtypes)
+#  PAC PDFs   : handled via pac_importer.py (separate module)
+# ──────────────────────────────────────────────────────────────────────────────
+
 import pandas as pd
 import re
+import hashlib
 from typing import List, Dict, Tuple, Optional
 from datetime import datetime
 
+# ── end of imports ────────────────────────────────────────────────────────────
 
-# -----------------------------------------------------------------------
-# SCALAR HELPER — prevents "truth value of Series is ambiguous" errors
-# -----------------------------------------------------------------------
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  SCALAR HELPER  —  prevents "truth value of Series is ambiguous" errors
+# ──────────────────────────────────────────────────────────────────────────────
+
 def _scalar(val):
-    """Always return a plain scalar, never a Series."""
+    """Always return a plain scalar value, never a Series."""
     if isinstance(val, pd.Series):
         val = val.iloc[0] if not val.empty else None
     if val is None:
@@ -23,10 +28,24 @@ def _scalar(val):
         return None
     return val
 
+# ── end of scalar helper ─────────────────────────────────────────────────────
 
-# -----------------------------------------------------------------------
-# NORMALIZERS  (from Production Power Query)
-# -----------------------------------------------------------------------
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  FILE HASH HELPER  —  used for duplicate-import detection
+# ──────────────────────────────────────────────────────────────────────────────
+
+def file_hash(content: bytes) -> str:
+    """Return a short SHA-256 hex digest of raw file bytes."""
+    return hashlib.sha256(content).hexdigest()[:16]
+
+# ── end of file hash helper ───────────────────────────────────────────────────
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  NORMALIZERS  —  from Production Power Query logic
+# ──────────────────────────────────────────────────────────────────────────────
+
 SKIP_PHRASES = [
     "PROPERTY OF COMPASS GROUP", "PRINTED BY", "BILL TO",
     "SHIP TO", "ITEMS ORDERED", "TOTAL COST ORDERED"
@@ -38,6 +57,7 @@ PACK_NORM = {
     'CTN': 'CASE', 'CT': 'CASE',
     'EACH': 'EACH', 'EA': 'EACH', 'E': 'EACH',
 }
+
 
 def normalize_pack_type(raw: str) -> str:
     """fxNormalizePackType — matches production Power Query logic."""
@@ -51,11 +71,9 @@ def normalize_pack_type(raw: str) -> str:
     s = str(raw).strip().upper()
     s = re.sub(r'[^A-Z0-9/\s\-X.]', '', s)
     s = re.sub(r'/EACH$', '/EA', s)
-    s = re.sub(r'/1$', '/EA', s)
-    parts = re.split(r'([^A-Z0-9])', s)
-    normed = []
-    for p in parts:
-        normed.append(PACK_NORM.get(p, p))
+    s = re.sub(r'/1$',    '/EA', s)
+    parts  = re.split(r'([^A-Z0-9])', s)
+    normed = [PACK_NORM.get(p, p) for p in parts]
     result = ''.join(normed).strip()
     return result if result else 'CASE'
 
@@ -85,8 +103,8 @@ def clean_price(value) -> Optional[float]:
 
 def split_gl_field(gl_string: str) -> Tuple[str, str]:
     """
-    'Produce 411085' -> ('Produce', '411085')
-    '411085'         -> ('', '411085')
+    'Produce 411085'  ->  ('Produce', '411085')
+    '411085'          ->  ('',        '411085')
     """
     if not gl_string:
         return ('', '')
@@ -108,17 +126,21 @@ def should_skip_row(row_values) -> bool:
     row_str = ' '.join(str(v) for v in row_values if pd.notna(v)).upper()
     return any(p in row_str for p in SKIP_PHRASES)
 
+# ── end of normalizers ────────────────────────────────────────────────────────
 
-# -----------------------------------------------------------------------
-# HEADER DETECTION
-# -----------------------------------------------------------------------
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  HEADER DETECTION
+# ──────────────────────────────────────────────────────────────────────────────
+
 HEADER_REQUIRED = ['ITEM', 'DESC', 'PRODUCT']
 HEADER_PACK     = ['PACK', 'UOM']
 HEADER_PRICE    = ['PRICE', 'COST', 'INVOICED']
 
+
 def _is_header_row(row) -> bool:
-    vals = [str(v).upper() for v in row if pd.notna(v)]
-    joined = ' '.join(vals)
+    vals      = [str(v).upper() for v in row if pd.notna(v)]
+    joined    = ' '.join(vals)
     has_item  = any(k in joined for k in HEADER_REQUIRED)
     has_pack  = any(k in joined for k in HEADER_PACK)
     has_price = any(k in joined for k in HEADER_PRICE)
@@ -133,29 +155,34 @@ def find_header_row(df: pd.DataFrame, max_rows: int = 25) -> int:
             return i
     return 0
 
+# ── end of header detection ───────────────────────────────────────────────────
 
-# -----------------------------------------------------------------------
-# COLUMN NORMALISER
-# -----------------------------------------------------------------------
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  COLUMN NORMALIZER  —  maps raw header names to canonical field names
+# ──────────────────────────────────────────────────────────────────────────────
+
 COL_MAP = {
     'ITEM DESCRIPTION': 'description', 'ITEM DESC': 'description',
-    'DESCRIPTION': 'description', 'ITEM': 'description',
-    'DESC': 'description', 'PRODUCT': 'description',
-    'PACK TYPE': 'pack_type', 'PACK': 'pack_type',
-    'UOM': 'pack_type',
-    'INVOICED PRICE': 'cost', 'CONFIRMED PRICE': 'cost',
-    'CURRENT PRICE': 'cost', 'COST': 'cost', 'PRICE': 'cost',
-    'INVOICED QUANTITY': 'quantity', 'CONFIRMED QUANTITY': 'quantity',
-    'QUANTITY': 'quantity',
-    'GL CODE': 'gl_field', 'GL': 'gl_field', 'ACCOUNT': 'gl_field',
-    'VENDOR': 'vendor', 'VENDORS': 'vendor',
+    'DESCRIPTION':      'description', 'ITEM':      'description',
+    'DESC':             'description', 'PRODUCT':   'description',
+    'PACK TYPE':        'pack_type',   'PACK':      'pack_type',
+    'UOM':              'pack_type',
+    'INVOICED PRICE':   'cost',  'CONFIRMED PRICE': 'cost',
+    'CURRENT PRICE':    'cost',  'COST':            'cost',
+    'PRICE':            'cost',
+    'INVOICED QUANTITY':   'quantity', 'CONFIRMED QUANTITY': 'quantity',
+    'QUANTITY':            'quantity',
+    'GL CODE':  'gl_field', 'GL':      'gl_field', 'ACCOUNT': 'gl_field',
+    'VENDOR':   'vendor',   'VENDORS': 'vendor',
     'ITEM NUMBER': 'item_number',
-    'MOG': 'mog', 'BRAND': 'brand', 'MFG': 'brand',
-    'GTIN': 'gtin',
+    'MOG':   'mog',  'BRAND': 'brand', 'MFG':  'brand',
+    'GTIN':  'gtin',
     'STATUS': 'status', 'CONFIRMATION STATUS': 'status',
-    'CATEGORY': 'category',
+    'CATEGORY':      'category',
     'DELIVERY DATE': 'delivery_date',
 }
+
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     rename = {}
@@ -164,21 +191,27 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
         if key in COL_MAP:
             rename[col] = COL_MAP[key]
     df = df.rename(columns=rename)
-    # Drop duplicate columns after renaming, keeping first occurrence
+    # Drop duplicate columns produced by renaming, keeping first occurrence
     df = df.loc[:, ~df.columns.duplicated()]
     return df
 
+# ── end of column normalizer ──────────────────────────────────────────────────
 
-# -----------------------------------------------------------------------
-# MAIN IMPORTER CLASS
-# -----------------------------------------------------------------------
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  INVENTORY IMPORTER CLASS
+# ──────────────────────────────────────────────────────────────────────────────
+
 class InventoryImporter:
 
     def __init__(self, database):
-        self.db = database
+        self.db     = database
         self.errors: List[str] = []
 
-    # -- File reading --------------------------------------------------
+    # ──────────────────────────────────────────────────────────────────────────
+    #  FILE READING
+    # ──────────────────────────────────────────────────────────────────────────
+
     def read_file(self, filepath: str) -> Optional[pd.DataFrame]:
         self.errors = []
         try:
@@ -186,9 +219,9 @@ class InventoryImporter:
                 df = pd.read_csv(filepath, encoding='utf-8-sig', dtype=str)
             elif filepath.lower().endswith(('.xlsx', '.xls')):
                 df = pd.read_excel(filepath, header=None, dtype=str)
-                hdr = find_header_row(df)
+                hdr        = find_header_row(df)
                 df.columns = df.iloc[hdr]
-                df = df.iloc[hdr + 1:].reset_index(drop=True)
+                df         = df.iloc[hdr + 1:].reset_index(drop=True)
             else:
                 self.errors.append(f"Unsupported file type: {filepath}")
                 return None
@@ -198,25 +231,29 @@ class InventoryImporter:
             self.errors.append(f"Read error: {e}")
             return None
 
-    # -- Analysis pass (preview, no DB writes) -------------------------
+    # ── end of file reading ───────────────────────────────────────────────────
+
+
+    # ──────────────────────────────────────────────────────────────────────────
+    #  ANALYSIS PASS  —  preview changes, no DB writes
+    # ──────────────────────────────────────────────────────────────────────────
+
     def analyze_import(self, df: pd.DataFrame) -> Dict:
         analysis = {
             'total_rows': len(df),
-            'new_items': [],
-            'updates': [],
-            'skipped': [],
-            'errors': [],
+            'new_items':  [],
+            'updates':    [],
+            'skipped':    [],
+            'errors':     [],
         }
 
         for idx, row in df.iterrows():
             row = row.where(pd.notna(row), None)
 
-            # Skip metadata rows
             if should_skip_row(row.values):
                 analysis['skipped'].append(idx)
                 continue
 
-            # Skip B2 substitution rows
             status = str(_scalar(row.get('status')) or '').upper()
             pack   = str(_scalar(row.get('pack_type')) or '')
             if 'SUBSTITUTION' in status or pack.strip() == '99':
@@ -244,21 +281,27 @@ class InventoryImporter:
                     if item_data.get(f) and str(current.get(f)) != str(item_data.get(f))
                 }
                 analysis['updates'].append({
-                    'key': key,
+                    'key':         key,
                     'description': str(description),
-                    'changes': changes,
-                    'row_data': item_data
+                    'changes':     changes,
+                    'row_data':    item_data,
                 })
             else:
                 analysis['new_items'].append({
-                    'key': key,
+                    'key':         key,
                     'description': str(description),
-                    'row_data': item_data
+                    'row_data':    item_data,
                 })
 
         return analysis
 
-    # -- Execute -------------------------------------------------------
+    # ── end of analysis pass ──────────────────────────────────────────────────
+
+
+    # ──────────────────────────────────────────────────────────────────────────
+    #  EXECUTE  —  write selected items to DB
+    # ──────────────────────────────────────────────────────────────────────────
+
     def execute_import(self, analysis: Dict,
                        changed_by: str = "import",
                        source_document: str = None,
@@ -278,7 +321,7 @@ class InventoryImporter:
                     item['row_data'],
                     doc_date=doc_date,
                     source_document=source_document,
-                    changed_by=changed_by
+                    changed_by=changed_by,
                 )
                 if result in ('updated', 'created'):
                     results['items_updated'] += 1
@@ -287,7 +330,13 @@ class InventoryImporter:
 
         return results
 
-    # -- Full pipeline -------------------------------------------------
+    # ── end of execute ────────────────────────────────────────────────────────
+
+
+    # ──────────────────────────────────────────────────────────────────────────
+    #  FULL PIPELINE  —  read → analyze → (optionally) execute in one call
+    # ──────────────────────────────────────────────────────────────────────────
+
     def import_file(self, filepath: str,
                     changed_by: str = "import",
                     auto_approve: bool = True) -> Tuple[Dict, Dict]:
@@ -302,12 +351,18 @@ class InventoryImporter:
                 analysis,
                 changed_by=changed_by,
                 source_document=Path(filepath).name,
-                doc_date=doc_date
+                doc_date=doc_date,
             )
             return analysis, results
         return analysis, {}
 
-    # -- Row prep ------------------------------------------------------
+    # ── end of full pipeline ──────────────────────────────────────────────────
+
+
+    # ──────────────────────────────────────────────────────────────────────────
+    #  ROW PREPARATION  —  maps a raw DataFrame row to a clean item dict
+    # ──────────────────────────────────────────────────────────────────────────
+
     def _prepare_row(self, row, key: str, pack_norm: str) -> Dict:
         item = {
             'key':         key,
@@ -324,7 +379,7 @@ class InventoryImporter:
             if val:
                 item[field] = str(val).strip()
 
-        # GL field — may be "Produce 411085" combined
+        # GL field — may be combined e.g. "Produce 411085"
         gl_raw = _scalar(row.get('gl_field')) or _scalar(row.get('gl_code')) or ''
         if gl_raw:
             gl_name, gl_code = split_gl_field(str(gl_raw))
@@ -332,7 +387,7 @@ class InventoryImporter:
                 item['gl_code'] = gl_code
                 item['gl_name'] = gl_name
             elif gl_name:
-                item['gl_code'] = gl_name  # bare code stored as-is
+                item['gl_code'] = gl_name
 
         qty = _scalar(row.get('quantity'))
         if qty is not None:
@@ -342,3 +397,7 @@ class InventoryImporter:
                 pass
 
         return item
+
+    # ── end of row preparation ────────────────────────────────────────────────
+
+# ── end of InventoryImporter class ───────────────────────────────────────────
