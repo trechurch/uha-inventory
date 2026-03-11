@@ -92,23 +92,37 @@ def page_inventory():
     st.title("📦 Inventory Items")
     db = get_db()
 
-    # Search + filter bar
+    # ── Fetch ALL active items once for GL options + display ──
+    all_items = db.get_all_items("active")
+
+    # ── Search + filter bar ───────────────────────────────────
     col1, col2, col3 = st.columns([3, 2, 1])
     with col1:
         search = st.text_input("🔍 Search", placeholder="item name, vendor, GL code...")
     with col2:
-        gl_filter = st.text_input("GL Code filter", placeholder="411039")
+        gl_options = sorted(set(
+            i.get("gl_code") for i in all_items if i.get("gl_code")
+        ))
+        gl_filter = st.multiselect(
+            "GL Code filter",
+            options=gl_options,
+            placeholder="All GL codes",
+        )
     with col3:
         show_disc = st.checkbox("Show discontinued")
 
-    # Fetch items
+    # ── Apply filters ─────────────────────────────────────────
     if search:
         items = db.search_items(search)
+        if not show_disc:
+            items = [i for i in items if i.get("record_status") == "active"]
+    elif show_disc:
+        items = db.get_all_items(None)
     else:
-        items = db.get_all_items("active" if not show_disc else None)
+        items = all_items
 
     if gl_filter:
-        items = [i for i in items if (i.get("gl_code") or "").startswith(gl_filter)]
+        items = [i for i in items if i.get("gl_code") in gl_filter]
 
     if not items:
         st.info("No items found.")
@@ -273,7 +287,6 @@ def page_import():
                             f"Done! {results['new_items_added']} added, "
                             f"{results['items_updated']} updated."
                         )
-                        # Archive to OneDrive if connected
                         if od.get_access_token():
                             od.archive_file(f.name, content)
                             st.info("📁 Archived to OneDrive.")
@@ -298,8 +311,8 @@ def page_import():
                         content = od.download_import_file(f["name"])
                         if content:
                             st.info(f"Processing {f['name']}...")
-                            # write to temp file, run importer
                             import tempfile, os
+                            from pathlib import Path
                             suffix = Path(f["name"]).suffix
                             with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
                                 tmp.write(content)
@@ -360,10 +373,8 @@ def page_history():
 
     key_input = st.text_input("Enter item key or search term")
     if key_input:
-        # Try exact key first
         history = db.get_item_history(key_input)
         if not history:
-            # Search for matching items
             items = db.search_items(key_input)
             if items:
                 keys = [i["key"] for i in items]
@@ -389,7 +400,6 @@ def page_export():
     items = db.get_all_items()
     if items:
         df = pd.DataFrame(items)
-        # Excel export
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
             df.to_excel(writer, index=False, sheet_name="Inventory")
@@ -401,7 +411,6 @@ def page_export():
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
-        # CSV export
         csv = df.to_csv(index=False)
         st.download_button(
             "⬇️ Download as CSV",
