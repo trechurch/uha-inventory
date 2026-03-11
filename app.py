@@ -44,7 +44,7 @@ def get_gl():
 
 def _init_import_state():
     if "import_data"      not in st.session_state:
-        st.session_state.import_data      = []   # list of per-file dicts
+        st.session_state.import_data      = []
     if "import_committed" not in st.session_state:
         st.session_state.import_committed = False
     if "import_results"   not in st.session_state:
@@ -105,7 +105,6 @@ def page_inventory():
     st.title("📦 Inventory Items")
     db = get_db()
 
-    # Fetch all active items once — used for GL dropdown and default display
     all_items = db.get_all_items("active")
 
     col1, col2, col3 = st.columns([3, 2, 1])
@@ -123,7 +122,6 @@ def page_inventory():
     with col3:
         show_disc = st.checkbox("Show discontinued")
 
-    # Apply filters
     if search:
         items = db.search_items(search)
         if not show_disc:
@@ -230,44 +228,92 @@ def _edit_item_form(db, item: dict):
 
 
 # ────────────────────────────────────────────────────────────────────
-# IMPORT PAGE — helpers
+# IMPORT PAGE — checkbox state helpers
 # ────────────────────────────────────────────────────────────────────
 
 def _ck(filename: str, item_key: str) -> str:
-    """Build a unique, stable checkbox session-state key."""
+    """Unique session_state key for an individual item checkbox."""
     return f"chk||{filename}||{item_key}"
+
+
+def _all_items_for_file(d: dict) -> list:
+    if not d.get("analysis"):
+        return []
+    return d["analysis"]["new_items"] + d["analysis"]["updates"]
+
+
+def _file_selection_state(d: dict):
+    """
+    Returns: True  = all checked
+             False = none checked
+             None  = some checked (indeterminate)
+    """
+    items = _all_items_for_file(d)
+    if not items:
+        return False
+    checked = [st.session_state.get(_ck(d["filename"], i["key"]), True) for i in items]
+    if all(checked):
+        return True
+    if not any(checked):
+        return False
+    return None  # indeterminate
+
+
+def _global_selection_state() -> object:
+    """
+    Returns: True  = all files fully checked
+             False = nothing checked anywhere
+             None  = mixed (indeterminate)
+    """
+    states = [_file_selection_state(d) for d in st.session_state.import_data if d.get("analysis")]
+    if not states:
+        return False
+    if all(s is True for s in states):
+        return True
+    if all(s is False for s in states):
+        return False
+    return None
+
+
+def _set_file_items(d: dict, value: bool):
+    for item in _all_items_for_file(d):
+        st.session_state[_ck(d["filename"], item["key"])] = value
+
+
+def _set_all_items(value: bool):
+    for d in st.session_state.import_data:
+        _set_file_items(d, value)
+
+
+def _toggle_icon(state) -> str:
+    """
+    True        → ☑  (all selected)
+    False       → ☐  (none selected)
+    None        → ▣  (some selected — indeterminate)
+    """
+    if state is True:
+        return "☑"
+    if state is False:
+        return "☐"
+    return "▣"
 
 
 def _count_selected() -> int:
     total = 0
     for d in st.session_state.import_data:
-        if not d["analysis"]:
-            continue
-        for item in d["analysis"]["new_items"] + d["analysis"]["updates"]:
+        for item in _all_items_for_file(d):
             if st.session_state.get(_ck(d["filename"], item["key"]), True):
                 total += 1
     return total
 
 
-def _set_all(value: bool, filename: str = None):
-    """Set all checkboxes to value. If filename given, only that file."""
-    for d in st.session_state.import_data:
-        if filename and d["filename"] != filename:
-            continue
-        if not d["analysis"]:
-            continue
-        for item in d["analysis"]["new_items"] + d["analysis"]["updates"]:
-            st.session_state[_ck(d["filename"], item["key"])] = value
-
-
 def _analyze_uploaded_files(uploaded_files, importer):
-    """Read + analyze all uploaded files; store results in session_state."""
     st.session_state.import_data      = []
     st.session_state.import_committed = False
     st.session_state.import_results   = {}
 
     for f in uploaded_files:
-        content       = f.read()
+        content        = f.read()
         parse_warnings = []
         analysis       = None
         suffix         = ".csv" if f.name.lower().endswith(".csv") else ".xlsx"
@@ -302,16 +348,15 @@ def _analyze_uploaded_files(uploaded_files, importer):
         }
         st.session_state.import_data.append(entry)
 
-        # Pre-populate checkbox state — default all selected (True)
+        # Pre-populate checkboxes — default all True (selected)
         if analysis:
-            for item in analysis["new_items"] + analysis["updates"]:
-                key = _ck(f.name, item["key"])
-                if key not in st.session_state:
-                    st.session_state[key] = True
+            for item in _all_items_for_file(entry):
+                ck = _ck(f.name, item["key"])
+                if ck not in st.session_state:
+                    st.session_state[ck] = True
 
 
 def _execute_selected_imports(importer):
-    """Commit only the checked items across all files."""
     results = {
         "files_processed": 0,
         "new_items_added": 0,
@@ -327,14 +372,13 @@ def _execute_selected_imports(importer):
         filename = d["filename"]
 
         selected_new = [
-            item for item in analysis["new_items"]
-            if st.session_state.get(_ck(filename, item["key"]), True)
+            i for i in analysis["new_items"]
+            if st.session_state.get(_ck(filename, i["key"]), True)
         ]
         selected_upd = [
-            item for item in analysis["updates"]
-            if st.session_state.get(_ck(filename, item["key"]), True)
+            i for i in analysis["updates"]
+            if st.session_state.get(_ck(filename, i["key"]), True)
         ]
-
         if not selected_new and not selected_upd:
             continue
 
@@ -351,11 +395,10 @@ def _execute_selected_imports(importer):
             doc_date=doc_date,
         )
         results["new_items_added"] += r.get("new_items_added", 0)
-        results["items_updated"]   += r.get("items_updated", 0)
+        results["items_updated"]   += r.get("items_updated",   0)
         results["errors"].extend(r.get("errors", []))
         results["files_processed"] += 1
 
-        # Archive to OneDrive if connected
         if od.get_access_token():
             od.archive_file(filename, d["content"])
 
@@ -364,11 +407,22 @@ def _execute_selected_imports(importer):
     st.rerun()
 
 
-def _render_import_review(importer):
-    """Unified multi-file selection + commit UI."""
-    data = st.session_state.import_data
+# ────────────────────────────────────────────────────────────────────
+# IMPORT REVIEW UI
+# ────────────────────────────────────────────────────────────────────
 
-    # ── Totals across all files ──────────────────────────────────────
+def _render_select_all_toggle(state, button_key: str, label_suffix: str = "") -> bool:
+    """
+    Renders a single toggle button that shows ☐ / ☑ / ▣.
+    Returns True if clicked.
+    """
+    icon  = _toggle_icon(state)
+    label = f"{icon}  Select All{' ' + label_suffix if label_suffix else ''}"
+    return st.button(label, key=button_key)
+
+
+def _render_import_review(importer):
+    data          = st.session_state.import_data
     total_files   = len(data)
     total_new     = sum(len(d["analysis"]["new_items"]) for d in data if d["analysis"])
     total_upd     = sum(len(d["analysis"]["updates"])   for d in data if d["analysis"])
@@ -378,8 +432,9 @@ def _render_import_review(importer):
     )
     total_warn    = sum(len(d["parse_warnings"]) for d in data)
     selected_now  = _count_selected()
+    global_state  = _global_selection_state()
 
-    # ── Top summary bar ──────────────────────────────────────────────
+    # ── Top summary metrics ──────────────────────────────────────────
     mc1, mc2, mc3, mc4, mc5 = st.columns(5)
     mc1.metric("Files",        total_files)
     mc2.metric("🆕 New Items", total_new)
@@ -392,124 +447,117 @@ def _render_import_review(importer):
 
     st.markdown("---")
 
-    # ── Global select / commit row (TOP) ─────────────────────────────
-    ga, gb, gc, gd = st.columns([2, 2, 2, 3])
-    ga.markdown(f"**{total_files} file(s) &nbsp;·&nbsp; {total_new + total_upd} total changes**")
+    # ── Global Select All + top Commit ──────────────────────────────
+    gh1, gh2 = st.columns([3, 3])
 
-    if gb.button("☑️ Select ALL items", key="sel_all_top"):
-        _set_all(True)
-        st.rerun()
+    with gh1:
+        # Toggle: if all selected → clicking deselects all; otherwise → selects all
+        if _render_select_all_toggle(global_state, "glob_sel_top",
+                                     f"({total_new + total_upd} items across {total_files} files)"):
+            _set_all_items(global_state is not True)   # True→deselect, False/None→select
+            st.rerun()
 
-    if gc.button("🔲 Deselect ALL", key="desel_all_top"):
-        _set_all(False)
-        st.rerun()
-
-    commit_label = f"✅ Commit {selected_now} change{'s' if selected_now != 1 else ''}"
-    if gd.button(commit_label, key="commit_top", type="primary",
-                 disabled=(selected_now == 0)):
-        _execute_selected_imports(importer)
+    with gh2:
+        commit_label = f"✅ Commit {selected_now} change{'s' if selected_now != 1 else ''}"
+        if st.button(commit_label, key="commit_top", type="primary",
+                     disabled=(selected_now == 0)):
+            _execute_selected_imports(importer)
 
     st.markdown("---")
 
     # ── Per-file sections ────────────────────────────────────────────
     for d in data:
-        filename      = d["filename"]
-        analysis      = d["analysis"]
-        warnings      = d["parse_warnings"]
-        size_str      = (
+        filename   = d["filename"]
+        analysis   = d["analysis"]
+        warnings   = d["parse_warnings"]
+        size_str   = (
             f"{d['size'] / 1024:.1f} KB"
-            if d["size"] < 1024 * 1024
-            else f"{d['size'] / 1024 / 1024:.1f} MB"
+            if d["size"] < 1_048_576
+            else f"{d['size'] / 1_048_576:.1f} MB"
         )
+        file_state = _file_selection_state(d)
+        file_items = _all_items_for_file(d)
+        file_sel   = sum(
+            1 for i in file_items
+            if st.session_state.get(_ck(filename, i["key"]), True)
+        )
+        file_new   = len(analysis["new_items"]) if analysis else 0
+        file_upd   = len(analysis["updates"])   if analysis else 0
 
-        # File header
-        fh1, fh2, fh3 = st.columns([4, 3, 3])
-        fh1.markdown(f"### 📄 {filename}")
-        fh2.caption(size_str)
+        # File header row
+        fh1, fh2, fh3, fh4 = st.columns([4, 2, 2, 3])
+        fh1.markdown(f"**📄 {filename}** &nbsp; `{size_str}`")
+        fh2.caption(f"🆕 {file_new} new")
+        fh3.caption(f"🔄 {file_upd} updates")
 
         if analysis is None:
-            fh3.error("❌ Failed to parse")
+            fh4.error("❌ Failed to parse")
             for w in warnings:
                 st.caption(f"&nbsp;&nbsp;⚠️ {w}")
             st.markdown("---")
             continue
 
-        file_items    = analysis["new_items"] + analysis["updates"]
-        file_new      = len(analysis["new_items"])
-        file_upd      = len(analysis["updates"])
-        file_selected = sum(
-            1 for item in file_items
-            if st.session_state.get(_ck(filename, item["key"]), True)
-        )
-
-        # File stats row
-        fs1, fs2, fs3, fs4 = st.columns([2, 2, 2, 3])
-        fs1.metric("🆕 New",     file_new,  label_visibility="visible")
-        fs2.metric("🔄 Updates", file_upd,  label_visibility="visible")
-        fs3.metric("✅ Selected", file_selected, label_visibility="visible")
-
         if warnings:
-            fs4.warning(f"⚠️ {len(warnings)} parsing issue(s)")
+            fh4.warning(f"⚠️ {len(warnings)} parsing issue(s)")
             with st.expander("Show parsing issues"):
                 for w in warnings:
                     st.caption(w)
         else:
-            fs4.success("✅ No parsing issues")
+            fh4.success("✅ No parsing issues")
 
-        # File-level select buttons
-        fb1, fb2, fb3 = st.columns([2, 2, 4])
-        if fb1.button("☑️ Select all",   key=f"selall_{filename}"):
-            _set_all(True,  filename=filename)
-            st.rerun()
-        if fb2.button("🔲 Deselect all", key=f"deselall_{filename}"):
-            _set_all(False, filename=filename)
-            st.rerun()
+        # File-level Select All toggle
+        fs1, fs2 = st.columns([3, 5])
+        with fs1:
+            safe_key = filename.replace(" ", "_").replace(".", "_")
+            if _render_select_all_toggle(file_state, f"fsel_{safe_key}",
+                                         f"({file_sel}/{len(file_items)})"):
+                _set_file_items(d, file_state is not True)
+                st.rerun()
 
-        # Items list
+        # Individual items in expander
         with st.expander(
-            f"▼ Items ({file_selected} of {len(file_items)} selected)",
-            expanded=True
+            f"Items — {file_sel} of {len(file_items)} selected",
+            expanded=True,
         ):
             for item in file_items:
                 ck      = _ck(filename, item["key"])
                 is_new  = item in analysis["new_items"]
                 tag     = "🆕" if is_new else "🔄"
 
-                # Build change summary for updates
                 change_note = ""
                 if not is_new and item.get("changes"):
-                    parts = []
-                    for field, vals in item["changes"].items():
-                        old = vals.get("old", "")
-                        new = vals.get("new", "")
-                        parts.append(f"{field}: {old} → {new}")
-                    change_note = f"  \n&nbsp;&nbsp;&nbsp;&nbsp;_{',  '.join(parts)}_"
+                    parts = [
+                        f"{field}: {vals.get('old', '')} → {vals.get('new', '')}"
+                        for field, vals in item["changes"].items()
+                    ]
+                    change_note = f"  ·  *{',  '.join(parts)}*"
 
-                label = f"{tag} {item['description']}  `{item['key'].split('||')[1]}`{change_note}"
-                st.checkbox(label, key=ck)
+                label = f"{tag} **{item['description']}** `{item['key'].split('||')[1]}`{change_note}"
+                # Use the session_state value directly as the checkbox value
+                current_val = st.session_state.get(ck, True)
+                new_val = st.checkbox(label, value=current_val, key=ck)
+                # If individual item changed, Streamlit updates session_state automatically via key=
 
         st.markdown("---")
 
     # ── Bottom commit bar ────────────────────────────────────────────
-    selected_now2 = _count_selected()
-    bc1, bc2, bc3 = st.columns([3, 3, 3])
-    bc1.markdown(f"**{selected_now2} change{'s' if selected_now2 != 1 else ''} selected across {total_files} file(s)**")
+    selected_bot  = _count_selected()
+    global_state2 = _global_selection_state()
 
-    if bc2.button("☑️ Select ALL items", key="sel_all_bot"):
-        _set_all(True)
-        st.rerun()
-    if bc3.button("🔲 Deselect ALL", key="desel_all_bot"):
-        _set_all(False)
-        st.rerun()
-
-    commit_label2 = f"✅ Commit {selected_now2} change{'s' if selected_now2 != 1 else ''}"
-    if st.button(commit_label2, key="commit_bottom", type="primary",
-                 disabled=(selected_now2 == 0)):
-        _execute_selected_imports(importer)
+    bc1, bc2 = st.columns([3, 3])
+    with bc1:
+        if _render_select_all_toggle(global_state2, "glob_sel_bot",
+                                     f"({total_new + total_upd} items across {total_files} files)"):
+            _set_all_items(global_state2 is not True)
+            st.rerun()
+    with bc2:
+        commit_label2 = f"✅ Commit {selected_bot} change{'s' if selected_bot != 1 else ''}"
+        if st.button(commit_label2, key="commit_bot", type="primary",
+                     disabled=(selected_bot == 0)):
+            _execute_selected_imports(importer)
 
 
 def _render_import_results():
-    """Post-commit results screen."""
     r = st.session_state.import_results
     st.success("✅ Import committed successfully!")
 
@@ -552,35 +600,32 @@ def page_import():
         )
 
         if uploaded:
-            # Show uploaded files in a 3-column grid (no pagination)
+            # Show uploaded files in a compact 3-column grid — no pagination
             st.markdown("**Uploaded files:**")
             grid_cols = st.columns(3)
             for i, f in enumerate(uploaded):
                 size_str = (
                     f"{f.size / 1024:.1f} KB"
-                    if f.size < 1024 * 1024
-                    else f"{f.size / 1024 / 1024:.1f} MB"
+                    if f.size < 1_048_576
+                    else f"{f.size / 1_048_576:.1f} MB"
                 )
                 grid_cols[i % 3].markdown(f"📄 `{f.name}` &nbsp; {size_str}")
 
             st.markdown("---")
 
-            # Re-analyze only if file list has changed
-            uploaded_names  = [f.name for f in uploaded]
-            existing_names  = [d["filename"] for d in st.session_state.import_data]
+            uploaded_names = [f.name for f in uploaded]
+            existing_names = [d["filename"] for d in st.session_state.import_data]
 
             if uploaded_names != existing_names:
                 with st.spinner(f"Analyzing {len(uploaded)} file(s)..."):
                     _analyze_uploaded_files(uploaded, importer)
 
-            # Show results or review UI
             if st.session_state.import_committed:
                 _render_import_results()
             elif st.session_state.import_data:
                 _render_import_review(importer)
 
         else:
-            # Files were removed — reset state
             if st.session_state.import_data:
                 st.session_state.import_data      = []
                 st.session_state.import_committed = False
