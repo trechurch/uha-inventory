@@ -1,8 +1,8 @@
-"""
-Inventory Database - PostgreSQL/Supabase version
-Drop-in replacement for SQLite database.py
-Connection string loaded from environment / Streamlit secrets
-"""
+# ──────────────────────────────────────────────────────────────────────────────
+#  database.py  —  Inventory Database  —  PostgreSQL / Supabase
+#  Drop-in replacement for SQLite database.py
+#  Connection string loaded from environment / Streamlit secrets
+# ──────────────────────────────────────────────────────────────────────────────
 
 import os
 import json
@@ -12,6 +12,12 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
 from contextlib import contextmanager
 
+# ── end of imports ────────────────────────────────────────────────────────────
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  CONNECTION HELPERS
+# ──────────────────────────────────────────────────────────────────────────────
 
 def get_connection_string() -> str:
     """Get DB URL from Streamlit secrets or environment variable."""
@@ -35,6 +41,12 @@ def get_conn():
     finally:
         conn.close()
 
+# ── end of connection helpers ─────────────────────────────────────────────────
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  INVENTORY DATABASE CLASS
+# ──────────────────────────────────────────────────────────────────────────────
 
 class InventoryDatabase:
 
@@ -44,9 +56,10 @@ class InventoryDatabase:
             os.environ["SUPABASE_DB_URL"] = db_url
         self.create_tables()
 
-    # ------------------------------------------------------------------
-    # SCHEMA
-    # ------------------------------------------------------------------
+    # ──────────────────────────────────────────────────────────────────────────
+    #  SCHEMA — create tables and indexes if they don't exist
+    # ──────────────────────────────────────────────────────────────────────────
+
     def create_tables(self):
         with get_conn() as conn:
             cur = conn.cursor()
@@ -110,15 +123,31 @@ class InventoryDatabase:
                     imported_at TIMESTAMPTZ DEFAULT NOW()
                 );
 
+                CREATE TABLE IF NOT EXISTS import_log (
+                    log_id          SERIAL PRIMARY KEY,
+                    filename        TEXT,
+                    file_size       BIGINT,
+                    import_date     TIMESTAMPTZ DEFAULT NOW(),
+                    new_items       INTEGER DEFAULT 0,
+                    updated_items   INTEGER DEFAULT 0,
+                    changed_by      TEXT,
+                    file_hash       TEXT
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_items_description ON items(description);
                 CREATE INDEX IF NOT EXISTS idx_items_gl_code     ON items(gl_code);
                 CREATE INDEX IF NOT EXISTS idx_items_vendor      ON items(vendor);
                 CREATE INDEX IF NOT EXISTS idx_history_item_key  ON item_history(item_key);
+                CREATE INDEX IF NOT EXISTS idx_import_log_hash   ON import_log(file_hash);
             """)
 
-    # ------------------------------------------------------------------
-    # KEY BUILDER
-    # ------------------------------------------------------------------
+    # ── end of schema ─────────────────────────────────────────────────────────
+
+
+    # ──────────────────────────────────────────────────────────────────────────
+    #  KEY BUILDER
+    # ──────────────────────────────────────────────────────────────────────────
+
     @staticmethod
     def build_key(item_name: str, pack_type: str) -> Optional[str]:
         name = str(item_name or "").strip().upper()
@@ -127,9 +156,53 @@ class InventoryDatabase:
             return None
         return f"{name}||{pack}" if pack else f"{name}||CASE"
 
-    # ------------------------------------------------------------------
-    # CRUD
-    # ------------------------------------------------------------------
+    # ── end of key builder ────────────────────────────────────────────────────
+
+
+    # ──────────────────────────────────────────────────────────────────────────
+    #  IMPORT LOG  (duplicate-file detection)
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def log_import(self, filename: str, file_size: int,
+                   new_items: int, updated_items: int,
+                   changed_by: str, file_hash: str = None):
+        with get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO import_log
+                    (filename, file_size, new_items, updated_items, changed_by, file_hash)
+                VALUES (%s, %s, %s, %s, %s, %s)
+            """, (filename, file_size, new_items, updated_items, changed_by, file_hash))
+
+    def check_duplicate_import(self, filename: str, file_size: int,
+                                file_hash: str = None) -> Optional[Dict]:
+        """
+        Returns the previous import record if this file looks like a duplicate,
+        otherwise returns None.  Matches on hash (preferred) or filename+size.
+        """
+        with get_conn() as conn:
+            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            if file_hash:
+                cur.execute("""
+                    SELECT * FROM import_log WHERE file_hash = %s
+                    ORDER BY import_date DESC LIMIT 1
+                """, (file_hash,))
+            else:
+                cur.execute("""
+                    SELECT * FROM import_log
+                    WHERE filename = %s AND file_size = %s
+                    ORDER BY import_date DESC LIMIT 1
+                """, (filename, file_size))
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+    # ── end of import log ─────────────────────────────────────────────────────
+
+
+    # ──────────────────────────────────────────────────────────────────────────
+    #  CRUD — add, upsert, get, list, search, count, delete
+    # ──────────────────────────────────────────────────────────────────────────
+
     def add_item(self, item_data: Dict[str, Any],
                  changed_by: str = "system") -> bool:
         now = datetime.utcnow()
@@ -142,10 +215,10 @@ class InventoryDatabase:
         item_data.setdefault("is_chargeable", True)
         item_data.setdefault("status_tag", "Standard")
 
-        cols = list(item_data.keys())
-        vals = list(item_data.values())
+        cols         = list(item_data.keys())
+        vals         = list(item_data.values())
         placeholders = ", ".join(["%s"] * len(cols))
-        col_str = ", ".join(cols)
+        col_str      = ", ".join(cols)
         try:
             with get_conn() as conn:
                 cur = conn.cursor()
@@ -272,9 +345,13 @@ class InventoryDatabase:
                                   change_source="manual_deletion",
                                   changed_by=changed_by)
 
-    # ------------------------------------------------------------------
-    # SMART UPDATE + OVERRIDES
-    # ------------------------------------------------------------------
+    # ── end of CRUD ───────────────────────────────────────────────────────────
+
+
+    # ──────────────────────────────────────────────────────────────────────────
+    #  SMART UPDATE + OVERRIDE LOCKS
+    # ──────────────────────────────────────────────────────────────────────────
+
     def update_item_smart(self, key: str, incoming: Dict[str, Any],
                           doc_date: str = None,
                           source_document: str = None,
@@ -286,7 +363,7 @@ class InventoryDatabase:
         now = datetime.utcnow()
 
         if incoming.get("cost"):
-            updates["cost"] = incoming["cost"]
+            updates["cost"]       = incoming["cost"]
             updates["status_tag"] = "✅ Updated Today"
         if "quantity_on_hand" in incoming:
             updates["quantity_on_hand"] = incoming["quantity_on_hand"]
@@ -345,9 +422,13 @@ class InventoryDatabase:
                                   change_source="clear_override",
                                   changed_by=changed_by)
 
-    # ------------------------------------------------------------------
-    # HISTORY
-    # ------------------------------------------------------------------
+    # ── end of smart update + override locks ──────────────────────────────────
+
+
+    # ──────────────────────────────────────────────────────────────────────────
+    #  HISTORY READERS
+    # ──────────────────────────────────────────────────────────────────────────
+
     def get_item_history(self, key: str, limit: int = 100) -> List[Dict]:
         with get_conn() as conn:
             cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
@@ -366,9 +447,22 @@ class InventoryDatabase:
             """, (key, limit))
             return [dict(r) for r in cur.fetchall()]
 
-    # ------------------------------------------------------------------
-    # INTERNALS
-    # ------------------------------------------------------------------
+    def get_import_log(self, limit: int = 50) -> List[Dict]:
+        with get_conn() as conn:
+            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cur.execute("""
+                SELECT * FROM import_log
+                ORDER BY import_date DESC LIMIT %s
+            """, (limit,))
+            return [dict(r) for r in cur.fetchall()]
+
+    # ── end of history readers ────────────────────────────────────────────────
+
+
+    # ──────────────────────────────────────────────────────────────────────────
+    #  INTERNAL WRITE HELPERS
+    # ──────────────────────────────────────────────────────────────────────────
+
     def _apply_update(self, key: str, updates: Dict[str, Any],
                       change_source: str = "system",
                       source_document: str = None,
@@ -380,7 +474,7 @@ class InventoryDatabase:
             return False
         try:
             set_clause = ", ".join([f"{k} = %s" for k in updates])
-            vals = list(updates.values()) + [key]
+            vals       = list(updates.values()) + [key]
             with get_conn() as conn:
                 cur = conn.cursor()
                 cur.execute(f"UPDATE items SET {set_clause} WHERE key = %s", vals)
@@ -389,13 +483,15 @@ class InventoryDatabase:
                     continue
                 old_val = current.get(field)
                 if str(old_val) != str(new_val):
-                    self._add_history(key, "field_update",
-                                      field_changed=field,
-                                      old_value=str(old_val) if old_val is not None else "",
-                                      new_value=str(new_val) if new_val is not None else "",
-                                      change_source=change_source,
-                                      source_document=source_document,
-                                      changed_by=changed_by)
+                    self._add_history(
+                        key, "field_update",
+                        field_changed=field,
+                        old_value=str(old_val) if old_val is not None else "",
+                        new_value=str(new_val) if new_val is not None else "",
+                        change_source=change_source,
+                        source_document=source_document,
+                        changed_by=changed_by,
+                    )
             return True
         except Exception as e:
             print(f"Error updating {key}: {e}")
@@ -425,3 +521,7 @@ class InventoryDatabase:
                 INSERT INTO price_history (item_key, price, doc_date, source_file, vendor)
                 VALUES (%s, %s, %s, %s, %s)
             """, (key, price, doc_date, source_file, vendor))
+
+    # ── end of internal write helpers ────────────────────────────────────────
+
+# ── end of InventoryDatabase class ───────────────────────────────────────────
