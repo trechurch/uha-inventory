@@ -160,7 +160,7 @@ _INJECT_CSS = """
   // Store start time for elapsed display
   window._uhaStart = null;
 
-  window._uhaSet = function(pct, label, state, elapsed) {{
+  window._uhaSet = function(pct, label, state, elapsed) {
     var bar   = document.getElementById('uha-status-bar');
     var fill  = document.getElementById('uha-progress-fill');
     var lbl   = document.getElementById('uha-status-label');
@@ -171,7 +171,7 @@ _INJECT_CSS = """
     fill.style.width = (pct * 100).toFixed(1) + '%';
     lbl.textContent = label || '';
     tim.textContent = elapsed ? elapsed + 's' : '';
-  }};
+  };
 </script>
 """
 
@@ -205,11 +205,11 @@ class StatusBar:
         Must be called near the top of every page function so the bar
         is present regardless of which page is active.
         """
-        # Double the scroll text so the loop is seamless
         scroll = (_SCROLL_WORDS + "  " + _SCROLL_WORDS)
-        html   = _INJECT_CSS.format(scroll_text=scroll)
+        # Use simple replace rather than .format() so CSS/JS braces don't
+        # need escaping — {scroll_text} is the only placeholder in the template.
+        html = _INJECT_CSS.replace("{scroll_text}", scroll)
         st.markdown(html, unsafe_allow_html=True)
-        # Store a JS-update placeholder in session state
         if "_status_ph" not in st.session_state:
             st.session_state["_status_ph"] = st.empty()
 
