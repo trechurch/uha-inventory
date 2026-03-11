@@ -3,13 +3,23 @@
 #  Runs from anywhere via Streamlit Community Cloud
 # ──────────────────────────────────────────────────────────────────────────────
 
-import streamlit as st
-import pandas as pd
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  STDLIB + THIRD-PARTY IMPORTS
+# ──────────────────────────────────────────────────────────────────────────────
+
+import re
 import io
 import tempfile
 import os
 from datetime import datetime
 from typing import Optional
+
+import streamlit as st
+import pandas as pd
+
+# ── end of stdlib + third-party imports ──────────────────────────────────────
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  PAGE CONFIG  (must be the very first Streamlit call)
@@ -26,7 +36,7 @@ st.set_page_config(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  MODULE IMPORTS
+#  LOCAL MODULE IMPORTS
 # ──────────────────────────────────────────────────────────────────────────────
 
 from database import InventoryDatabase
@@ -34,7 +44,7 @@ from importer import InventoryImporter
 from gl_manager import GLCodeManager
 import onedrive_connector as od
 
-# ── end of module imports ─────────────────────────────────────────────────────
+# ── end of local module imports ───────────────────────────────────────────────
 
 
 # ──────────────────────────────────────────────────────────────────────────────
