@@ -8,6 +8,7 @@ import os
 import json
 import psycopg2
 import psycopg2.extras
+import psycopg2.errors
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
 from contextlib import contextmanager
@@ -18,7 +19,7 @@ from contextlib import contextmanager
 #  VERSION
 # ──────────────────────────────────────────────────────────────────────────────
 
-__version__ = "3.0.3"
+__version__ = "3.0.4"
 
 # ── end of version ────────────────────────────────────────────────────────────
 
@@ -763,8 +764,10 @@ class InventoryDatabase:
                              CASE WHEN cost_center = %s THEN 0 ELSE 1 END
                 """, (list(keys), cost_center, cost_center))
                 return {row["item_key"]: dict(row) for row in cur.fetchall()}
-        except psycopg2.errors.UndefinedTable:
+        except (psycopg2.ProgrammingError, psycopg2.OperationalError, 
+                psycopg2.errors.UndefinedTable) as e:
             # Table doesn't exist yet (first run before create_tables has executed)
+            print(f"Count overrides table not found (expected on first run): {e}")
             return {}
         except Exception as e:
             print(f"Error fetching count overrides: {e}")
