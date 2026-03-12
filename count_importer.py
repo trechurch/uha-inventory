@@ -28,12 +28,11 @@ from importer import normalize_pack_type, detect_encoding
 
 # ── end of imports ────────────────────────────────────────────────────────────
 
-
 # ──────────────────────────────────────────────────────────────────────────────
 #  VERSION
 # ──────────────────────────────────────────────────────────────────────────────
 
-__version__ = "3.0.0"
+__version__ = "3.0.1"
 
 # ── end of version ────────────────────────────────────────────────────────────
 
@@ -503,11 +502,38 @@ class CountImporter:
 
     def _parse_csv(self, content_bytes: bytes,
                    default_location: str = "Unspecified") -> List[CountRecord]:
+        """
+        myOrders CSV exports have several metadata rows at the top before the
+        real column header row.  We read with header=None, scan for the first
+        row that contains the known column names, then slice from there —
+        exactly the same strategy as _parse_xlsx.
+        """
         enc = detect_encoding(content_bytes)
-        df = pd.read_csv(io.BytesIO(content_bytes), encoding=enc,
-                         encoding_errors='replace', dtype=str)
-        df.columns = [str(c).strip() for c in df.columns]
+        raw = pd.read_csv(
+            io.BytesIO(content_bytes),
+            encoding=enc,
+            encoding_errors='replace',
+            dtype=str,
+            header=None,
+        )
+        raw = raw.where(pd.notna(raw), None)
+
+        # ── Find the real header row ─────────────────────────────────────────
+        header_row = 0
+        known_headers = {k.upper() for k in COUNT_COL_MAP}
+        for i, row in raw.iterrows():
+            vals = {str(v).strip().upper() for v in row if v}
+            if vals & known_headers:   # at least one known column name found
+                header_row = i
+                break
+
+        # ── Slice: header row → columns, everything below → data ────────────
+        df = raw.iloc[header_row + 1:].copy()
+        df.columns = [str(v).strip() if v else f"col_{i}"
+                      for i, v in enumerate(raw.iloc[header_row])]
+        df = df.reset_index(drop=True)
         df = df.where(pd.notna(df), None)
+
         return _merge_separated_df(df, location=default_location)
 
     # ── end of CSV parser ─────────────────────────────────────────────────────
