@@ -1,7 +1,7 @@
 # ──────────────────────────────────────────────────────────────────────────────
 #  count_importer.py  —  On-Hand / Cost-Center Count Import
 #  Handles the three export formats from the myOrders count system:
-#    • CSV  — Separated, single OR all locations, sorted by Seq
+#    • CSV  — Separated, single location, sorted by Seq
 #    • XLSX — Separated, all locations, column[0] = Classification
 #    • PDF  — Combined (slash-delimited), all locations, section headers
 #
@@ -11,11 +11,6 @@
 #  All three produce the same normalized CountRecord list, which is then
 #  diff'd against the database to generate a variance report before any
 #  writes are committed.
-#
-#  Encoding note: myOrders exports are Windows-1252 (not UTF-8).  A single
-#  ® or ™ in a product name must never crash the importer.  Encoding is
-#  auto-detected via detect_encoding() from importer.py; unknown bytes are
-#  replaced and logged, never fatal.
 # ──────────────────────────────────────────────────────────────────────────────
 
 import re
@@ -28,7 +23,7 @@ from typing import List, Dict, Optional, Tuple
 
 import pandas as pd
 
-from importer import normalize_pack_type, detect_encoding
+from importer import normalize_pack_type
 
 # ── end of imports ────────────────────────────────────────────────────────────
 
@@ -64,9 +59,6 @@ SKIP_PHRASES = [
     'grouped by', 'track market->non', 'non-chargeable',
 ]
 
-# Keywords that identify the true column-header row in the myOrders CSV/XLSX
-HEADER_KEYWORDS = {'seq', 'pack type', 'inv count', 'item description', 'total price'}
-
 # Default variance flagging thresholds
 DEFAULT_FLAG_EACH  = 24    # flag if |variance_each| > this many units
 DEFAULT_FLAG_VALUE = 50.0  # flag if |variance $| > this amount
@@ -92,7 +84,7 @@ class CountRecord:
     count_qty_each: float = 0.0
     price_case:     float = 0.0
     price_each:     float = 0.0
-    total_price:    float = 0.0  # authoritative pre-computed value from export
+    total_price:    float = 0.0
     uom_case:       str   = "CS"
     uom_each:       str   = "EA"
     is_chargeable:  bool  = True
@@ -214,20 +206,6 @@ def _is_skip_line(text: str) -> bool:
 def _file_hash(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()[:16]
 
-
-def _find_count_header_row(raw: pd.DataFrame) -> int:
-    """
-    Scan rows to find the actual column-header row in a myOrders export.
-    Looks for a row containing at least 2 of the known header keywords.
-    Returns the row index; defaults to 4 (known myOrders offset) on failure.
-    """
-    for i, row in raw.iterrows():
-        row_text = ' '.join(str(v).strip().lower() for v in row if pd.notna(v) and v)
-        matches = sum(1 for kw in HEADER_KEYWORDS if kw in row_text)
-        if matches >= 2:
-            return i
-    return 4   # known myOrders default
-
 # ── end of scalar + parse helpers ────────────────────────────────────────────
 
 
@@ -258,26 +236,13 @@ def detect_format(filename: str, content_bytes: bytes) -> Dict:
 
     try:
         if ext == 'csv':
-            enc = detect_encoding(content_bytes)
-            raw = pd.read_csv(
-                io.BytesIO(content_bytes),
-                encoding=enc,
-                encoding_errors='replace',
-                header=None,
-                dtype=str,
-                nrows=10,
-            )
-            # Find the actual header row
-            hdr_idx = _find_count_header_row(raw)
-            if hdr_idx < len(raw):
-                header_vals = [str(v).strip().lower() for v in raw.iloc[hdr_idx] if pd.notna(v)]
-                # First column is a location column if its header is 'grouped by: classification'
-                # or if it doesn't match any known numeric/seq column name
-                first_col = header_vals[0] if header_vals else ''
-                has_location = ('classification' in first_col or
-                                ('seq' not in first_col and 'pack' not in first_col))
-            # Check if qty values contain "/" (combined format)
-            sample = raw.to_string()
+            df = pd.read_csv(io.BytesIO(content_bytes), encoding='utf-8-sig',
+                             dtype=str, nrows=5)
+            # Check first column for non-numeric location strings
+            has_location = bool(re.search(r'[A-Za-z]', str(df.columns[0])) and
+                                'seq' not in str(df.columns[0]).lower())
+            # Check if qty values contain "/" (combined)
+            sample = df.to_string()
             if re.search(r'\d+\.\d+\s+\w+/\d+\.\d+\s+\w+', sample):
                 layout = 'combined'
 
@@ -327,13 +292,6 @@ def _merge_separated_df(df: pd.DataFrame, location: str = "Unspecified") -> List
     """
     Given a DataFrame with 2 rows per item (CS row + EA row),
     group by (seq, description) and merge into one CountRecord per item.
-
-    total_price is SUMMED across CS and EA rows (not max'd) because both
-    rows carry independent pre-computed values from the export.  An item
-    with 3 Cases ($100.08) and 27 Each ($37.53) must yield $137.61, not $100.08.
-
-    Rows with a blank UOM and blank description are grand-total sentinel rows
-    injected by myOrders — they are silently skipped.
     """
     records: List[CountRecord] = []
 
@@ -349,33 +307,32 @@ def _merge_separated_df(df: pd.DataFrame, location: str = "Unspecified") -> List
     if not required.issubset(set(df.columns)):
         return records
 
-    seen = {}  # group_key → partial CountRecord dict
+    # Group rows by (seq, description)  — seq may be missing
+    group_cols = []
+    if 'seq' in df.columns:
+        group_cols.append('seq')
+    group_cols.append('description')
+
+    seen = {}  # key → partial CountRecord dict
 
     for _, row in df.iterrows():
         row = row.where(pd.notna(row), None)
 
         desc = _scalar(row.get('description'))
-        uom  = str(_scalar(row.get('uom')) or '').strip()
-
-        # Skip rows with blank description (grand-total sentinels, blank spacers)
         if not desc or _is_skip_line(str(desc)):
-            continue
-
-        # Skip the embedded grand-total row: UOM is blank, description is blank
-        # (catches "Total" sentinel rows injected by myOrders at end of export)
-        if not uom and not str(desc).strip():
             continue
 
         seq       = str(_scalar(row.get('seq')) or '').strip()
         pack_type = str(_scalar(row.get('pack_type')) or '').strip()
+        uom       = str(_scalar(row.get('uom')) or '').strip()
         price     = _to_float(_scalar(row.get('price')))
         qty_raw   = str(_scalar(row.get('last_qty')) or '0')
         cnt_raw   = str(_scalar(row.get('inv_count')) or '0')
         tot_price = _to_float(_scalar(row.get('total_price')))
 
         # Extract numeric part of qty (e.g. "96.00 EA" → 96.0)
-        qty_num = _to_float(re.sub(r'[^\d.]', '', qty_raw.split()[0]) if qty_raw.split() else '0')
-        cnt_num = _to_float(re.sub(r'[^\d.]', '', cnt_raw.split()[0]) if cnt_raw.split() else '0')
+        qty_num   = _to_float(re.sub(r'[^\d.]', '', qty_raw.split()[0]) if qty_raw.split() else '0')
+        cnt_num   = _to_float(re.sub(r'[^\d.]', '', cnt_raw.split()[0]) if cnt_raw.split() else '0')
 
         group_key = f"{seq}||{str(desc).strip().upper()}"
 
@@ -386,15 +343,12 @@ def _merge_separated_df(df: pd.DataFrame, location: str = "Unspecified") -> List
                 'last_qty_case': 0.0, 'last_qty_each': 0.0,
                 'count_qty_case': 0.0, 'count_qty_each': 0.0,
                 'price_case': 0.0, 'price_each': 0.0,
-                'total_price': 0.0,   # will be summed, not max'd
+                'total_price': 0.0,
                 'uom_case': 'CS', 'uom_each': 'EA',
             }
 
         entry = seen[group_key]
-
-        # SUM total_price across CS and EA rows — each row carries its own
-        # pre-computed authoritative value; they must be added, not compared.
-        entry['total_price'] += tot_price
+        entry['total_price'] = max(entry['total_price'], tot_price)
 
         if _uom_is_case(uom):
             entry['last_qty_case']  = qty_num
@@ -527,81 +481,15 @@ class CountImporter:
 
 
     # ──────────────────────────────────────────────────────────────────────────
-    #  CSV PARSER  —  Separated, single OR all locations, sorted by Seq
-    #
-    #  myOrders CSVs have a 4-row metadata block before the actual column
-    #  headers.  The true header row is found dynamically rather than assumed
-    #  to be row 0.  Encoding is auto-detected — never hardcoded.
-    #
-    #  If the first data column is a Classification/location column (as in the
-    #  all-locations export), the file is split by location exactly as the
-    #  XLSX parser does.  Single-location CSVs fall back to default_location.
+    #  CSV PARSER  —  Separated, single location, sorted by Seq
     # ──────────────────────────────────────────────────────────────────────────
 
     def _parse_csv(self, content_bytes: bytes,
                    default_location: str = "Unspecified") -> List[CountRecord]:
-        enc = detect_encoding(content_bytes)
-
-        # Read raw with no header assumption — metadata rows are at the top
-        raw = pd.read_csv(
-            io.BytesIO(content_bytes),
-            encoding=enc,
-            encoding_errors='replace',
-            header=None,
-            dtype=str,
-        )
-        raw = raw.where(pd.notna(raw), None)
-
-        # Locate the actual column-header row
-        hdr_idx = _find_count_header_row(raw)
-
-        # Build proper column names from that row
-        col_names = [
-            str(v).strip() if v is not None else f"col_{i}"
-            for i, v in enumerate(raw.iloc[hdr_idx])
-        ]
-        df = raw.iloc[hdr_idx + 1:].copy()
-        df.columns = col_names
-        df = df.reset_index(drop=True)
+        df = pd.read_csv(io.BytesIO(content_bytes), encoding='utf-8-sig', dtype=str)
+        df.columns = [str(c).strip() for c in df.columns]
         df = df.where(pd.notna(df), None)
-
-        # Determine whether the first column is a location/classification column
-        first_col_header = col_names[0].strip().upper() if col_names else ''
-        is_location_col  = (
-            'CLASSIFICATION' in first_col_header or
-            'GROUPED BY' in first_col_header or
-            (first_col_header and
-             first_col_header not in {'SEQ', 'PACK TYPE', 'UOM', 'PRICE'})
-        )
-
-        if is_location_col:
-            # All-locations CSV: split by location exactly as XLSX parser does
-            df = df.rename(columns={col_names[0]: 'location'})
-            records: List[CountRecord] = []
-            locations = df['location'].dropna().unique()
-
-            for loc in locations:
-                loc_str = str(loc).strip()
-                if not loc_str:
-                    continue
-                # Skip the grand-total sentinel row injected by myOrders
-                if loc_str.lower() == 'total':
-                    continue
-
-                is_chargeable = 'non-chargeable' not in loc_str.lower()
-                loc_df = df[df['location'] == loc].copy()
-                loc_df = loc_df.drop(columns=['location'])
-
-                loc_records = _merge_separated_df(loc_df, location=loc_str)
-                for r in loc_records:
-                    r.is_chargeable = is_chargeable
-                records.extend(loc_records)
-
-            return records
-
-        else:
-            # Single-location CSV: no location column, use default_location
-            return _merge_separated_df(df, location=default_location)
+        return _merge_separated_df(df, location=default_location)
 
     # ── end of CSV parser ─────────────────────────────────────────────────────
 
@@ -620,18 +508,26 @@ class CountImporter:
         raw = raw.where(pd.notna(raw), None)
 
         # Find the header row (contains 'Seq' or 'Pack Type')
-        hdr_idx = _find_count_header_row(raw)
+        header_row = 4  # default for known format
+        for i, row in raw.iterrows():
+            vals = [str(v).strip().lower() for v in row if v]
+            if 'seq' in vals or 'pack type' in vals:
+                header_row = i
+                break
 
-        df = raw.iloc[hdr_idx + 1:].copy()
+        df = raw.iloc[header_row + 1:].copy()
         df.columns = [str(v).strip() if v else f"col_{i}"
-                      for i, v in enumerate(raw.iloc[hdr_idx])]
+                      for i, v in enumerate(raw.iloc[header_row])]
         df = df.reset_index(drop=True)
         df = df.where(pd.notna(df), None)
 
         # The first column is the location / classification
+        # Rename it and then split by location
         first_col = df.columns[0]
         df = df.rename(columns={first_col: 'location'})
 
+        # Non-Chargeable rows: filter or tag them
+        # (We keep them but mark is_chargeable=False)
         records: List[CountRecord] = []
         locations = df['location'].dropna().unique()
 
@@ -639,10 +535,8 @@ class CountImporter:
             loc_str = str(loc).strip()
             if not loc_str:
                 continue
-            # Skip the grand-total sentinel row
-            if loc_str.lower() == 'total':
-                continue
 
+            # Determine chargeability from location name
             is_chargeable = 'non-chargeable' not in loc_str.lower()
 
             loc_df = df[df['location'] == loc].copy()
@@ -817,19 +711,36 @@ class CountImporter:
             db_qty      = float(db_item.get("quantity_on_hand") or 0) if in_db else 0.0
             db_price_ea = float(db_item.get("cost") or 0)             if in_db else rec.price_each
 
-            # Effective new qty — fold case count in via conv_ratio when known
-            new_qty = rec.count_qty_each
-            if in_db and db_item.get("conv_ratio"):
-                try:
-                    conv = float(db_item["conv_ratio"])
-                    if conv > 0:
-                        new_qty += rec.count_qty_case * conv
-                except (ValueError, TypeError):
-                    new_qty += rec.count_qty_case
+            # ── Resolve conv_ratio ───────────────────────────────────────────
+            #  Priority:
+            #    1. DB conv_ratio if set and > 0
+            #    2. Leading integer in pack_type string  ("12/24oz CAN" → 12)
+            #    3. Default = 1  — null/zero NEVER silently drops case qty
+            conv = None
 
-            variance_each  = new_qty - db_qty
-            eff_price      = rec.price_each if rec.price_each > 0 else db_price_ea
-            variance_value = variance_each * eff_price
+            if in_db:
+                try:
+                    db_conv = float(db_item.get("conv_ratio") or 0)
+                    if db_conv > 0:
+                        conv = db_conv
+                except (ValueError, TypeError):
+                    pass
+
+            if conv is None:
+                pt_match = re.match(r'^(\d+)/', str(rec.pack_type or '').strip())
+                if pt_match:
+                    extracted = int(pt_match.group(1))
+                    if extracted > 0:
+                        conv = float(extracted)
+
+            if conv is None:
+                conv = 1.0   # absolute fallback — never drop case qty
+
+            new_qty = rec.count_qty_each + (rec.count_qty_case * conv)
+
+            variance_each   = new_qty - db_qty
+            eff_price       = rec.price_each if rec.price_each > 0 else db_price_ea
+            variance_value  = variance_each * eff_price
 
             is_flagged  = False
             flag_reason = ""
@@ -883,10 +794,6 @@ class CountImporter:
         add_missing=False: items not in DB are skipped (original behavior).
 
         Returns a summary dict.
-
-        Value totals use rec.total_price (the authoritative pre-computed value
-        from the export spreadsheet) rather than recomputing new_qty × price_each.
-        This ensures total_new_value matches the SUM(Total Price) in the source file.
         """
         results = {
             'import_id':        meta.import_id,
@@ -901,15 +808,13 @@ class CountImporter:
         }
 
         # ── Pre-compute value totals ─────────────────────────────────────────
-        #  total_new_value  — sum the authoritative Total Price from the export,
-        #                     never recompute as new_qty × price_each
-        #  total_prev_value — previous on-hand value using DB qty × DB price
         for vr in variance_records:
             rec = vr.record
-            results['total_prev_value']    += vr.db_qty * (
+            results['total_prev_value']      += vr.db_qty * (
                 vr.db_price_each if vr.db_price_each else rec.price_each)
-            results['total_new_value']     += rec.total_price
-            results['total_variance_value'] += vr.variance_value
+            results['total_new_value']        += vr.new_qty * (
+                rec.price_each if rec.price_each else vr.db_price_each)
+            results['total_variance_value']   += vr.variance_value
             if vr.is_flagged:
                 results['items_flagged'] += 1
 
