@@ -19,7 +19,7 @@ import streamlit as st
 #  VERSION
 # ──────────────────────────────────────────────────────────────────────────────
 
-__version__ = "3.0.0"
+__version__ = "3.0.1"
 
 # ── end of version ────────────────────────────────────────────────────────────
 
@@ -316,6 +316,10 @@ class StatusBar:
         sidebar_js = (
             "document.body.classList.toggle('uha-sidebar-hidden');"
             "this.classList.toggle('uha-active');"
+            "const isHidden = document.body.classList.contains('uha-sidebar-hidden');"
+            "const url = new URL(window.top.location);"
+            "url.searchParams.set('sidebar', isHidden ? '0' : '1');"
+            "window.top.history.replaceState(null, '', url);"
         )
 
         html = _TOPNAV_CSS + f"""
@@ -342,8 +346,8 @@ class StatusBar:
                 css_class = "uha-item" if enabled else "uha-item uha-disabled"
                 if enabled and item.page_key:
                     onclick = (
-                        f"window.location.href = "
-                        f"window.location.pathname + "
+                        f"window.top.location.href = "
+                        f"window.top.location.pathname + "
                         f"'?page={item.page_key}';"
                     )
                     items_html += (
