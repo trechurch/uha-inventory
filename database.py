@@ -18,7 +18,7 @@ from contextlib import contextmanager
 #  VERSION
 # ──────────────────────────────────────────────────────────────────────────────
 
-__version__ = "3.0.1"
+__version__ = "3.0.2"
 
 # ── end of version ────────────────────────────────────────────────────────────
 
@@ -217,6 +217,36 @@ class InventoryDatabase:
                 CREATE INDEX IF NOT EXISTS idx_count_imports_date     ON count_imports(count_date DESC);
                 CREATE INDEX IF NOT EXISTS idx_count_variance_import  ON count_variance_detail(import_id);
                 CREATE INDEX IF NOT EXISTS idx_count_variance_item    ON count_variance_detail(item_key);
+
+                CREATE TABLE IF NOT EXISTS count_overrides (
+                    id              SERIAL PRIMARY KEY,
+                    item_key        TEXT NOT NULL,
+                    cost_center     TEXT NOT NULL DEFAULT '*',
+                    divisor         NUMERIC(10,4) NOT NULL DEFAULT 1.0,
+                    case_behavior   TEXT NOT NULL DEFAULT 'ignore',
+                    notes           TEXT,
+                    created_by      TEXT DEFAULT 'user',
+                    created_at      TIMESTAMPTZ DEFAULT NOW(),
+                    updated_at      TIMESTAMPTZ DEFAULT NOW(),
+                    is_active       BOOLEAN DEFAULT TRUE,
+                    UNIQUE (item_key, cost_center)
+                );
+
+                CREATE TABLE IF NOT EXISTS count_override_settings (
+                    id              SERIAL PRIMARY KEY,
+                    setting_key     TEXT UNIQUE NOT NULL,
+                    setting_value   TEXT NOT NULL,
+                    updated_at      TIMESTAMPTZ DEFAULT NOW()
+                );
+
+                INSERT INTO count_override_settings (setting_key, setting_value)
+                VALUES
+                    ('default_scope',         'global'),
+                    ('default_case_behavior', 'ignore')
+                ON CONFLICT (setting_key) DO NOTHING;
+
+                CREATE INDEX IF NOT EXISTS idx_count_overrides_key  ON count_overrides(item_key);
+                CREATE INDEX IF NOT EXISTS idx_count_overrides_cc   ON count_overrides(cost_center);
             """)
 
     # ── end of schema ─────────────────────────────────────────────────────────
@@ -703,6 +733,130 @@ class InventoryDatabase:
             return {row["key"]: dict(row) for row in cur.fetchall()}
 
     # ── end of bulk item fetch ────────────────────────────────────────────────
+
+
+    # ──────────────────────────────────────────────────────────────────────────
+    #  COUNT OVERRIDES  —  per-item qty correction rules (e.g. MOG items with
+    #  wrong pack ratios that cannot be edited in the source system)
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def get_count_overrides_bulk(self, keys: List[str],
+                                  cost_center: str = "*") -> Dict[str, Dict]:
+        """
+        Fetch all active overrides for a list of item keys in one query.
+        Resolution order: exact cost_center match wins over global '*'.
+        Returns {item_key: override_dict}.
+        """
+        if not keys:
+            return {}
+        with get_conn() as conn:
+            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cur.execute("""
+                SELECT DISTINCT ON (item_key)
+                    item_key, cost_center, divisor, case_behavior, notes
+                FROM count_overrides
+                WHERE item_key = ANY(%s)
+                  AND is_active = TRUE
+                  AND (cost_center = %s OR cost_center = '*')
+                ORDER BY item_key,
+                         CASE WHEN cost_center = %s THEN 0 ELSE 1 END
+            """, (list(keys), cost_center, cost_center))
+            return {row["item_key"]: dict(row) for row in cur.fetchall()}
+
+    def upsert_count_override(self, item_key: str, divisor: float,
+                               case_behavior: str = "ignore",
+                               cost_center: str = "*",
+                               notes: str = "",
+                               created_by: str = "user") -> bool:
+        """Insert or update a count override rule."""
+        try:
+            with get_conn() as conn:
+                cur = conn.cursor()
+                cur.execute("""
+                    INSERT INTO count_overrides
+                        (item_key, cost_center, divisor, case_behavior, notes, created_by, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                    ON CONFLICT (item_key, cost_center)
+                    DO UPDATE SET
+                        divisor       = EXCLUDED.divisor,
+                        case_behavior = EXCLUDED.case_behavior,
+                        notes         = EXCLUDED.notes,
+                        updated_at    = NOW(),
+                        is_active     = TRUE
+                """, (item_key, cost_center, divisor, case_behavior, notes, created_by))
+            return True
+        except Exception as e:
+            print(f"Error upserting override {item_key}: {e}")
+            return False
+
+    def delete_count_override(self, item_key: str,
+                               cost_center: str = "*") -> bool:
+        """Soft-delete an override (sets is_active=False)."""
+        try:
+            with get_conn() as conn:
+                cur = conn.cursor()
+                cur.execute("""
+                    UPDATE count_overrides
+                    SET is_active = FALSE, updated_at = NOW()
+                    WHERE item_key = %s AND cost_center = %s
+                """, (item_key, cost_center))
+            return True
+        except Exception as e:
+            print(f"Error deleting override {item_key}: {e}")
+            return False
+
+    def get_all_count_overrides(self) -> List[Dict]:
+        """Return all active overrides for the override manager UI."""
+        with get_conn() as conn:
+            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cur.execute("""
+                SELECT o.*, i.description, i.pack_type
+                FROM count_overrides o
+                LEFT JOIN items i ON i.key = o.item_key
+                WHERE o.is_active = TRUE
+                ORDER BY o.item_key
+            """)
+            return [dict(r) for r in cur.fetchall()]
+
+    # ── end of count overrides ────────────────────────────────────────────────
+
+
+    # ──────────────────────────────────────────────────────────────────────────
+    #  COUNT OVERRIDE SETTINGS  —  user preferences for default scope/behavior
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def get_override_setting(self, key: str, default: str = "") -> str:
+        """Get a single count override setting by key."""
+        try:
+            with get_conn() as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT setting_value FROM count_override_settings WHERE setting_key = %s",
+                    (key,)
+                )
+                row = cur.fetchone()
+                return row[0] if row else default
+        except Exception:
+            return default
+
+    def set_override_setting(self, key: str, value: str) -> bool:
+        """Persist a count override setting."""
+        try:
+            with get_conn() as conn:
+                cur = conn.cursor()
+                cur.execute("""
+                    INSERT INTO count_override_settings (setting_key, setting_value, updated_at)
+                    VALUES (%s, %s, NOW())
+                    ON CONFLICT (setting_key)
+                    DO UPDATE SET setting_value = EXCLUDED.setting_value,
+                                  updated_at    = NOW()
+                """, (key, value))
+            return True
+        except Exception as e:
+            print(f"Error saving setting {key}: {e}")
+            return False
+
+    # ── end of count override settings ───────────────────────────────────────
 
 
     # ──────────────────────────────────────────────────────────────────────────

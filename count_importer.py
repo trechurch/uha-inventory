@@ -32,7 +32,7 @@ from importer import normalize_pack_type, detect_encoding
 #  VERSION
 # ──────────────────────────────────────────────────────────────────────────────
 
-__version__ = "3.0.2"
+__version__ = "3.0.4"
 
 # ── end of version ────────────────────────────────────────────────────────────
 
@@ -42,10 +42,12 @@ __version__ = "3.0.2"
 # ──────────────────────────────────────────────────────────────────────────────
 
 # UOM tokens that identify a CASE-level row in separated format
-CASE_UOMS = {'case', 'cs', 'cases', 'cse', 'ctn'}
+# '1' is included because BIBs and single-unit bags (1/5GAL, 1/250, 50/1lb)
+# use '1' as their case UOM in myOrders exports
+CASE_UOMS = {'case', 'cs', 'cases', 'cse', 'ctn', '1'}
 
 # UOM tokens that identify an EACH-level row in separated format
-EACH_UOMS = {'each', 'ea', 'bx', 'box', 'sleeve', 'slv', '1', 'bag'}
+EACH_UOMS = {'each', 'ea', 'bx', 'box', 'sleeve', 'slv', 'bag'}
 
 # Column aliases used in count export files
 COUNT_COL_MAP = {
@@ -367,16 +369,18 @@ def _merge_separated_df(df: pd.DataFrame, location: str = "Unspecified") -> List
         entry['total_price'] += tot_price
 
         if _uom_is_case(uom):
-            entry['last_qty_case']  = qty_num
-            entry['count_qty_case'] = cnt_num
-            entry['price_case']     = price
+            entry['last_qty_case']  += qty_num   # accumulate across locations
+            entry['count_qty_case'] += cnt_num   # accumulate across locations
+            if price:
+                entry['price_case'] = price      # last non-zero price wins
             entry['uom_case']       = uom.upper()
             if not entry['pack_type'] and pack_type:
                 entry['pack_type'] = pack_type
         elif _uom_is_each(uom):
-            entry['last_qty_each']  = qty_num
-            entry['count_qty_each'] = cnt_num
-            entry['price_each']     = price
+            entry['last_qty_each']  += qty_num   # accumulate across locations
+            entry['count_qty_each'] += cnt_num   # accumulate across locations
+            if price:
+                entry['price_each'] = price      # last non-zero price wins
             entry['uom_each']       = uom.upper()
 
     # Convert merged dicts to CountRecord objects
@@ -744,8 +748,9 @@ class CountImporter:
             return []
 
         # ── Single bulk fetch ────────────────────────────────────────────────
-        all_keys = list({r.item_key for r in records})
-        db_map   = self.db.get_items_bulk(all_keys)   # {key: item_dict}
+        all_keys    = list({r.item_key for r in records})
+        db_map      = self.db.get_items_bulk(all_keys)        # {key: item_dict}
+        override_map = self.db.get_count_overrides_bulk(all_keys)  # {key: override_dict}
 
         # ── In-memory diff ───────────────────────────────────────────────────
         variance_list: List[VarianceRecord] = []
@@ -756,37 +761,59 @@ class CountImporter:
             db_qty      = float(db_item.get("quantity_on_hand") or 0) if in_db else 0.0
             db_price_ea = float(db_item.get("cost") or 0)             if in_db else rec.price_each
 
-            # ── Resolve conv_ratio ───────────────────────────────────────────
-            #  Priority:
-            #    1. DB conv_ratio if explicitly set (> 1) — manual override wins
-            #    2. Leading integer in pack_type string  ("12/24oz CAN" → 12)
-            #    3. Default = 1  — never silently drops case qty
+            # ── Check for MOG / bad-ratio override first ─────────────────────
+            #  Override rules live in count_overrides table and are managed via
+            #  the Override & Rule Manager page.  When active, the override
+            #  divisor replaces normal conv logic entirely.
             #
-            #  NOTE: conv_ratio = 1 in DB is treated as "not set" because the
-            #  schema default is 1, making it indistinguishable from an explicit
-            #  entry.  Pack_type extraction is the authoritative source for all
-            #  standard N/unit formats.
-            conv = None
+            #  case_behavior options:
+            #    'ignore' — only use each qty ÷ divisor  (default for MOG items)
+            #    'add'    — (each ÷ divisor) + (case × conv)
+            override = override_map.get(rec.item_key)
+            if override:
+                divisor       = float(override.get("divisor") or 1.0)
+                case_behavior = override.get("case_behavior", "ignore")
+                divisor       = divisor if divisor > 0 else 1.0
+                overridden_each = rec.count_qty_each / divisor
+                if case_behavior == "add":
+                    # still need a conv for the case portion
+                    pt_m = re.match(r'^(\d+)/', str(rec.pack_type or '').strip())
+                    case_conv = float(pt_m.group(1)) if pt_m else 1.0
+                    new_qty = overridden_each + (rec.count_qty_case * case_conv)
+                else:
+                    new_qty = overridden_each
+            else:
+                # ── Resolve conv_ratio ───────────────────────────────────────
+                #  Priority:
+                #    1. DB conv_ratio if explicitly set (> 1) — manual override wins
+                #    2. Leading integer in pack_type string  ("12/24oz CAN" → 12)
+                #    3. Default = 1  — never silently drops case qty
+                #
+                #  NOTE: conv_ratio = 1 in DB is treated as "not set" because the
+                #  schema default is 1, making it indistinguishable from an explicit
+                #  entry.  Pack_type extraction is the authoritative source for all
+                #  standard N/unit formats.
+                conv = None
 
-            if in_db:
-                try:
-                    db_conv = float(db_item.get("conv_ratio") or 0)
-                    if db_conv > 1:   # > 1, not > 0 — skip schema default of 1
-                        conv = db_conv
-                except (ValueError, TypeError):
-                    pass
+                if in_db:
+                    try:
+                        db_conv = float(db_item.get("conv_ratio") or 0)
+                        if db_conv > 1:   # > 1, not > 0 — skip schema default of 1
+                            conv = db_conv
+                    except (ValueError, TypeError):
+                        pass
 
-            if conv is None:
-                pt_match = re.match(r'^(\d+)/', str(rec.pack_type or '').strip())
-                if pt_match:
-                    extracted = int(pt_match.group(1))
-                    if extracted > 0:
-                        conv = float(extracted)
+                if conv is None:
+                    pt_match = re.match(r'^(\d+)/', str(rec.pack_type or '').strip())
+                    if pt_match:
+                        extracted = int(pt_match.group(1))
+                        if extracted > 0:
+                            conv = float(extracted)
 
-            if conv is None:
-                conv = 1.0   # absolute fallback — never drop case qty
+                if conv is None:
+                    conv = 1.0   # absolute fallback — never drop case qty
 
-            new_qty = rec.count_qty_each + (rec.count_qty_case * conv)
+                new_qty = rec.count_qty_each + (rec.count_qty_case * conv)
 
             variance_each   = new_qty - db_qty
             eff_price       = rec.price_each if rec.price_each > 0 else db_price_ea

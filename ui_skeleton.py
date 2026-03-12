@@ -116,6 +116,8 @@ class MenuBar:
                          icon="📋", feature_flag="count_import"),
                 MenuItem("Compare Files",   page_key="compare_counts",
                          icon="📊", feature_flag="compare_counts"),
+                MenuItem("Override & Rule Manager", page_key="count_overrides",
+                         icon="⚙️"),
                 MenuItem("", separator=True),
                 MenuItem("Import Mode...",  page_key="import_mode_selector",
                          icon="🧩", feature_flag="import_mode_selector"),

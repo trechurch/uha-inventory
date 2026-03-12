@@ -973,6 +973,207 @@ def _init_count_state():
             st.session_state[k] = v
 
 
+def page_count_overrides():
+    """Override & Rule Manager — MOG fix rules and count correction overrides."""
+    db = get_db()
+    st.title("⚙️ Override & Rule Manager")
+    st.caption(
+        "Manage count correction rules for items whose pack ratios cannot be changed "
+        "in the source system (e.g. MOG items). Rules are applied automatically during "
+        "every count import."
+    )
+
+    # ── Load & persist user preference defaults ───────────────────────────────
+    # These are the sticky defaults for the Add/Edit form — user changes are
+    # saved back to DB so they persist across sessions.
+    if "ovr_default_scope" not in st.session_state:
+        st.session_state["ovr_default_scope"] = db.get_override_setting(
+            "default_scope", "global"
+        )
+    if "ovr_default_case_behavior" not in st.session_state:
+        st.session_state["ovr_default_case_behavior"] = db.get_override_setting(
+            "default_case_behavior", "ignore"
+        )
+
+    # ── Tabs ──────────────────────────────────────────────────────────────────
+    tab_rules, tab_add, tab_prefs = st.tabs(
+        ["📋 Active Rules", "➕ Add / Edit Rule", "🔧 Default Preferences"]
+    )
+
+    # ────────────────────────────────────────────────────────────────────────
+    # TAB 1 — Active Rules table
+    # ────────────────────────────────────────────────────────────────────────
+    with tab_rules:
+        rules = db.get_all_count_overrides()
+        if not rules:
+            st.info("No override rules defined yet. Use the **Add / Edit Rule** tab to create one.")
+        else:
+            st.caption(f"{len(rules)} active rule(s)")
+            for rule in rules:
+                scope_label = (
+                    "🌐 Global" if rule["cost_center"] == "*"
+                    else f"📍 {rule['cost_center']}"
+                )
+                case_label = (
+                    "Ignore case qty" if rule["case_behavior"] == "ignore"
+                    else "Add case qty (÷ divisor + case × conv)"
+                )
+                desc  = rule.get("description") or rule["item_key"]
+                pt    = rule.get("pack_type") or "—"
+                notes = rule.get("notes") or ""
+
+                with st.expander(
+                    f"**{desc}** `{rule['item_key']}`  |  ÷ {rule['divisor']}  |  {scope_label}",
+                    expanded=False,
+                ):
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Divisor",       rule["divisor"])
+                    c2.metric("Scope",         scope_label)
+                    c3.metric("Case behavior", case_label)
+                    st.text(f"Pack type: {pt}")
+                    if notes:
+                        st.text(f"Notes: {notes}")
+                    if st.button(
+                        "🗑️ Delete rule",
+                        key=f"del_{rule['item_key']}_{rule['cost_center']}",
+                        type="secondary",
+                    ):
+                        db.delete_count_override(rule["item_key"], rule["cost_center"])
+                        st.success(f"Rule deleted for {desc}")
+                        st.rerun()
+
+    # ────────────────────────────────────────────────────────────────────────
+    # TAB 2 — Add / Edit Rule
+    # ────────────────────────────────────────────────────────────────────────
+    with tab_add:
+        st.markdown("#### Add or update a count correction rule")
+        st.caption(
+            "Tip: for MOG items with inverted pack ratios (e.g. 1LB Tray — the system "
+            "counts individual trays but expects cases of 1000), set **divisor** to 1000 "
+            "and **case behavior** to *Ignore case qty*."
+        )
+
+        # Pre-populate scope/behavior from saved defaults
+        default_scope    = st.session_state["ovr_default_scope"]
+        default_behavior = st.session_state["ovr_default_case_behavior"]
+
+        with st.form("add_override_form", clear_on_submit=True):
+            st.markdown("**Item key**")
+            st.caption("Format: `ITEM NAME||PACK_TYPE` (uppercase, double-pipe). "
+                       "Find it on the Items page.")
+            item_key = st.text_input(
+                "Item key", placeholder="1LB TRAY||1/1000", label_visibility="collapsed"
+            )
+
+            divisor = st.number_input(
+                "Divisor (each qty ÷ divisor = corrected each qty)",
+                min_value=0.0001, value=1000.0, step=1.0, format="%.4f"
+            )
+
+            scope_opts = ["global", "per cost center"]
+            scope = st.selectbox(
+                "Scope",
+                scope_opts,
+                index=scope_opts.index(default_scope) if default_scope in scope_opts else 0,
+                help="Global = applies to this item at every location. "
+                     "Per cost center = only applies at the specified cost center.",
+            )
+
+            cost_center = "*"
+            if scope == "per cost center":
+                cost_center = st.text_input(
+                    "Cost center name",
+                    placeholder="e.g. Ferttita",
+                    help="Must match the cost center prefix from the export file.",
+                )
+
+            behavior_opts  = ["ignore", "add"]
+            behavior_labels = [
+                "Ignore case qty — only use each ÷ divisor",
+                "Add case qty — (each ÷ divisor) + (case × conv)",
+            ]
+            behavior_idx = behavior_opts.index(default_behavior) if default_behavior in behavior_opts else 0
+            behavior = st.selectbox(
+                "Case quantity behavior",
+                behavior_opts,
+                index=behavior_idx,
+                format_func=lambda x: behavior_labels[behavior_opts.index(x)],
+            )
+
+            notes = st.text_input("Notes (optional)", placeholder="e.g. MOG item — tray count inverted")
+
+            save_as_default = st.checkbox(
+                "Save scope & case behavior as my new defaults",
+                value=False,
+            )
+
+            submitted = st.form_submit_button("💾 Save Rule", type="primary")
+
+        if submitted:
+            if not item_key.strip():
+                st.error("Item key is required.")
+            else:
+                cc = cost_center.strip() if scope == "per cost center" else "*"
+                ok = db.upsert_count_override(
+                    item_key     = item_key.strip().upper(),
+                    divisor      = float(divisor),
+                    case_behavior= behavior,
+                    cost_center  = cc,
+                    notes        = notes.strip(),
+                    created_by   = "user",
+                )
+                if ok:
+                    st.success(f"✅ Rule saved for `{item_key.strip().upper()}`")
+                    if save_as_default:
+                        db.set_override_setting("default_scope",         scope)
+                        db.set_override_setting("default_case_behavior", behavior)
+                        st.session_state["ovr_default_scope"]         = scope
+                        st.session_state["ovr_default_case_behavior"] = behavior
+                        st.info("Default preferences updated.")
+                else:
+                    st.error("Failed to save rule. Check the item key and try again.")
+
+    # ────────────────────────────────────────────────────────────────────────
+    # TAB 3 — Default Preferences
+    # ────────────────────────────────────────────────────────────────────────
+    with tab_prefs:
+        st.markdown("#### Default preferences for new rules")
+        st.caption(
+            "These defaults pre-fill the Add / Edit Rule form. They can also be "
+            "updated inline when saving any rule."
+        )
+
+        scope_opts     = ["global", "per cost center"]
+        behavior_opts  = ["ignore", "add"]
+        behavior_labels = [
+            "Ignore case qty — only use each ÷ divisor",
+            "Add case qty — (each ÷ divisor) + (case × conv)",
+        ]
+
+        pref_scope = st.selectbox(
+            "Default scope",
+            scope_opts,
+            index=scope_opts.index(st.session_state["ovr_default_scope"])
+                  if st.session_state["ovr_default_scope"] in scope_opts else 0,
+            key="pref_scope_select",
+        )
+        pref_behavior = st.selectbox(
+            "Default case behavior",
+            behavior_opts,
+            index=behavior_opts.index(st.session_state["ovr_default_case_behavior"])
+                  if st.session_state["ovr_default_case_behavior"] in behavior_opts else 0,
+            format_func=lambda x: behavior_labels[behavior_opts.index(x)],
+            key="pref_behavior_select",
+        )
+
+        if st.button("💾 Save Preferences", type="primary"):
+            db.set_override_setting("default_scope",         pref_scope)
+            db.set_override_setting("default_case_behavior", pref_behavior)
+            st.session_state["ovr_default_scope"]         = pref_scope
+            st.session_state["ovr_default_case_behavior"] = pref_behavior
+            st.success("Preferences saved.")
+
+
 def page_count_import():
     from count_importer import CountImportMeta
 
@@ -2115,6 +2316,7 @@ def main():
     elif page == "inventory":        page_inventory()
     elif page == "import":           page_import()
     elif page == "count_import":     page_count_import()
+    elif page == "count_overrides":  page_count_overrides()
     elif page == "gl_codes":         page_gl_codes()
     elif page == "history":          page_history()
     elif page == "export":           page_export()
