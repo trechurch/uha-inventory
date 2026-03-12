@@ -1129,13 +1129,119 @@ def page_count_import():
         else:
             st.success("No items exceed variance thresholds.")
 
+    # ──────────────────────────────────────────────────────────────────────────────
+#  PATCH — Diagnostic CSV Export for Count Import Variance
+#
+#  In app.py, find this line (around line 1135):
+#
+#      with tab_all:
+#          loc_opts = ["All"] + sorted(set(v.record.location for v in variance))
+#          sel_loc  = st.selectbox("Filter by location", loc_opts, key="var_loc_filter")
+#          show_rows = variance if sel_loc == "All" else [
+#              v for v in variance if v.record.location == sel_loc
+#          ]
+#          st.dataframe(_variance_df(show_rows), use_container_width=True, hide_index=True)
+#
+#  REPLACE that entire `with tab_all:` block with the version below.
+#  The export button also appears outside the tabs so it's always visible.
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ── REPLACE the existing `with tab_all:` block with this ─────────────────────
+
     with tab_all:
-        loc_opts = ["All"] + sorted(set(v.record.location for v in variance))
-        sel_loc  = st.selectbox("Filter by location", loc_opts, key="var_loc_filter")
+        loc_opts  = ["All"] + sorted(set(v.record.location for v in variance))
+        sel_loc   = st.selectbox("Filter by location", loc_opts, key="var_loc_filter")
         show_rows = variance if sel_loc == "All" else [
             v for v in variance if v.record.location == sel_loc
         ]
         st.dataframe(_variance_df(show_rows), use_container_width=True, hide_index=True)
+
+    # ── Diagnostic export — always visible, outside the tabs ─────────────────
+    #
+    #  Includes every field needed to trace the $33K vs $102K discrepancy:
+    #    count_qty_case / count_qty_each — raw counted quantities
+    #    price_case / price_each         — per-unit prices from export
+    #    total_price                     — authoritative pre-computed value
+    #    computed_value                  — what new_qty × price_each would give
+    #    variance_value                  — what was actually recorded
+    #    delta                           — total_price minus computed_value
+    #
+    st.markdown("---")
+    col_exp, col_sum = st.columns([2, 2])
+
+    with col_sum:
+        sum_total_price    = sum(v.record.total_price   for v in variance)
+        sum_computed_value = sum(
+            v.new_qty * (v.record.price_each if v.record.price_each > 0
+                         else v.db_price_each)
+            for v in variance
+        )
+        sum_variance_value = sum(v.variance_value for v in variance)
+        st.caption("**Totals — pre-export diagnostic**")
+        d1, d2, d3 = st.columns(3)
+        d1.metric("SUM(total_price)",    f"${sum_total_price:,.2f}",
+                  help="Direct sum of pre-computed Total Price from export rows.")
+        d2.metric("SUM(qty × price)",    f"${sum_computed_value:,.2f}",
+                  help="Recomputed: new_qty × price_each. Should differ from above if conv_ratio is missing.")
+        d3.metric("Delta",               f"${sum_total_price - sum_computed_value:+,.2f}",
+                  help="Positive = total_price is higher. This is the gap being diagnosed.")
+
+    with col_exp:
+        def _diagnostic_df(rows):
+            out = []
+            for v in rows:
+                rec           = v.record
+                eff_price     = rec.price_each if rec.price_each > 0 else v.db_price_each
+                computed_val  = round(v.new_qty * eff_price, 4)
+                out.append({
+                    "location":         rec.location,
+                    "seq":              rec.seq,
+                    "description":      rec.item_description,
+                    "pack_type":        rec.pack_type,
+                    "item_key":         rec.item_key,
+                    # --- counts ---
+                    "count_qty_case":   rec.count_qty_case,
+                    "count_qty_each":   rec.count_qty_each,
+                    "new_qty":          round(v.new_qty, 4),
+                    # --- prices ---
+                    "price_case":       rec.price_case,
+                    "price_each":       rec.price_each,
+                    "db_price_each":    round(v.db_price_each, 4),
+                    # --- values ---
+                    "total_price":      rec.total_price,      # from export (authoritative)
+                    "computed_value":   computed_val,         # new_qty × price_each
+                    "delta":            round(rec.total_price - computed_val, 4),
+                    "variance_value":   round(v.variance_value, 2),
+                    # --- db state ---
+                    "db_qty":           round(v.db_qty, 4),
+                    "in_db":            v.in_db,
+                    "is_flagged":       v.is_flagged,
+                    "flag_reason":      v.flag_reason,
+                    "is_chargeable":    rec.is_chargeable,
+                    # --- uom ---
+                    "uom_case":         rec.uom_case,
+                    "uom_each":         rec.uom_each,
+                })
+            return pd.DataFrame(out)
+
+        diag_df = _diagnostic_df(variance)
+
+        st.download_button(
+            label       = "⬇️ Export Diagnostic CSV",
+            data        = diag_df.to_csv(index=False).encode(),
+            file_name   = (
+                f"variance_diag_{uploaded.name.rsplit('.',1)[0]}"
+                f"_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
+            ),
+            mime        = "text/csv",
+            use_container_width=True,
+            help=(
+                "Full diagnostic export: raw counts, prices, total_price from export, "
+                "computed value, and delta. Use to trace the $33K vs $102K discrepancy."
+            ),
+        )
+
+# ── end of patch ──────────────────────────────────────────────────────────────
 
     # ── STEP 4 — COMMIT ───────────────────────────────────────────────────────
     st.markdown("---")
