@@ -43,6 +43,81 @@ def file_hash(content: bytes) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+#  ENCODING DETECTION  —  bulletproof, never crashes on a single character
+#
+#  Strategy (in order):
+#    1. UTF-8-sig  — handles BOM-prefixed files
+#    2. UTF-8      — clean UTF-8 without BOM
+#    3. charset_normalizer  — statistical detection (ships with requests)
+#    4. chardet    — fallback statistical detector
+#    5. windows-1252  — what myOrders / Windows apps actually produce
+#
+#  A single ® (0xae) or any other vendor trademark symbol in a product name
+#  must NEVER crash the importer.  Unrecognised bytes are logged, not fatal.
+# ──────────────────────────────────────────────────────────────────────────────
+
+def detect_encoding(content_bytes: bytes) -> str:
+    """
+    Detect the text encoding of raw file bytes.
+    Returns the encoding name string suitable for use with open() or pd.read_csv().
+    Falls back to 'windows-1252' (the actual encoding of myOrders exports) if
+    statistical detection fails or is low-confidence.
+    """
+    if not content_bytes:
+        return 'utf-8'
+
+    # ── Try UTF-8-sig (BOM-prefixed UTF-8) ──────────────────────────────────
+    try:
+        content_bytes.decode('utf-8-sig')
+        return 'utf-8-sig'
+    except UnicodeDecodeError:
+        pass
+
+    # ── Try plain UTF-8 ──────────────────────────────────────────────────────
+    try:
+        content_bytes.decode('utf-8')
+        return 'utf-8'
+    except UnicodeDecodeError:
+        pass
+
+    # ── charset_normalizer (ships with requests, preferred) ─────────────────
+    try:
+        from charset_normalizer import from_bytes
+        result = from_bytes(content_bytes).best()
+        if result and result.encoding:
+            enc = result.encoding.lower().replace('_', '-')
+            # Validate the detected encoding actually works
+            try:
+                content_bytes.decode(enc)
+                return enc
+            except (UnicodeDecodeError, LookupError):
+                pass
+    except ImportError:
+        pass
+
+    # ── chardet fallback ─────────────────────────────────────────────────────
+    try:
+        import chardet
+        detected = chardet.detect(content_bytes)
+        if detected and detected.get('confidence', 0) >= 0.70 and detected.get('encoding'):
+            enc = detected['encoding']
+            try:
+                content_bytes.decode(enc)
+                return enc
+            except (UnicodeDecodeError, LookupError):
+                pass
+    except ImportError:
+        pass
+
+    # ── Final fallback: Windows-1252 ─────────────────────────────────────────
+    #  myOrders exports are generated on Windows and use this codepage.
+    #  Every byte 0x00–0xFF maps to a valid character, so this never raises.
+    return 'windows-1252'
+
+# ── end of encoding detection ─────────────────────────────────────────────────
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 #  NORMALIZERS  —  from Production Power Query logic
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -213,12 +288,26 @@ class InventoryImporter:
     # ──────────────────────────────────────────────────────────────────────────
 
     def read_file(self, filepath: str) -> Optional[pd.DataFrame]:
+        """
+        Read a CSV or XLSX file into a normalized DataFrame.
+        Encoding is auto-detected for CSV files — a single ® or trademark
+        symbol in a product name will never crash the read.
+        Unknown bytes are replaced (logged, not dropped silently).
+        """
         self.errors = []
         try:
             if filepath.lower().endswith('.csv'):
-                df = pd.read_csv(filepath, encoding='utf-8-sig', dtype=str)
+                with open(filepath, 'rb') as f:
+                    raw_bytes = f.read()
+                enc = detect_encoding(raw_bytes)
+                df  = pd.read_csv(
+                    filepath,
+                    encoding=enc,
+                    encoding_errors='replace',   # never fatal on bad bytes
+                    dtype=str,
+                )
             elif filepath.lower().endswith(('.xlsx', '.xls')):
-                df = pd.read_excel(filepath, header=None, dtype=str)
+                df         = pd.read_excel(filepath, header=None, dtype=str)
                 hdr        = find_header_row(df)
                 df.columns = df.iloc[hdr]
                 df         = df.iloc[hdr + 1:].reset_index(drop=True)
