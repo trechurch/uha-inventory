@@ -1,3 +1,4 @@
+
 # ──────────────────────────────────────────────────────────────────────────────
 #  count_importer.py  —  On-Hand / Cost-Center Count Import
 #  Handles the three export formats from the myOrders count system:
@@ -323,6 +324,12 @@ def _merge_separated_df(df: pd.DataFrame, location: str = "Unspecified") -> List
         if not desc or _is_skip_line(str(desc)):
             continue
 
+        # Skip the grand-total sentinel row emitted by myOrders
+        # (the row where the location/classification cell reads "Total")
+        loc_cell = str(_scalar(row.get('location')) or '').strip().lower()
+        if loc_cell == 'total':
+            continue
+
         seq       = str(_scalar(row.get('seq')) or '').strip()
         pack_type = str(_scalar(row.get('pack_type')) or '').strip()
         uom       = str(_scalar(row.get('uom')) or '').strip()
@@ -349,7 +356,7 @@ def _merge_separated_df(df: pd.DataFrame, location: str = "Unspecified") -> List
             }
 
         entry = seen[group_key]
-        entry['total_price'] = max(entry['total_price'], tot_price)
+        entry['total_price'] += tot_price
 
         if _uom_is_case(uom):
             entry['last_qty_case']  = qty_num
@@ -813,11 +820,10 @@ class CountImporter:
         # ── Pre-compute value totals ─────────────────────────────────────────
         for vr in variance_records:
             rec = vr.record
-            results['total_prev_value']      += vr.db_qty * (
+            results['total_prev_value']    += vr.db_qty * (
                 vr.db_price_each if vr.db_price_each else rec.price_each)
-            results['total_new_value']        += vr.new_qty * (
-                rec.price_each if rec.price_each else vr.db_price_each)
-            results['total_variance_value']   += vr.variance_value
+            results['total_new_value']     += rec.total_price   # authoritative export value
+            results['total_variance_value'] += vr.variance_value
             if vr.is_flagged:
                 results['items_flagged'] += 1
 
