@@ -24,6 +24,15 @@ import onedrive_connector as od
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+#  VERSION
+# ──────────────────────────────────────────────────────────────────────────────
+
+__version__ = "3.0.0"
+
+# ── end of version ────────────────────────────────────────────────────────────
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 #  PAGE CONFIG  (must be the very first Streamlit call)
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -2081,6 +2090,25 @@ def main():
                             st.rerun()
 
     onedrive_auth_sidebar()
+
+    # ── Module versions ───────────────────────────────────────────────────────
+    with st.sidebar:
+        st.markdown("---")
+        with st.expander("🔧 Module Versions", expanded=False):
+            import importlib
+            _modules = [
+                "app", "database", "importer",
+                "count_importer", "gl_manager",
+                "ui_skeleton", "session_state", "status_bar",
+            ]
+            for _name in _modules:
+                try:
+                    _mod = importlib.import_module(_name)
+                    _ver = getattr(_mod, "__version__", "—")
+                except Exception:
+                    _ver = "error"
+                st.caption(f"`{_name}` — v{_ver}")
+    # ── end of module versions ────────────────────────────────────────────────
 
     # ── Route to page ─────────────────────────────────────────────────────────
     if   page == "dashboard":        page_dashboard()
