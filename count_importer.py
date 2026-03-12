@@ -23,7 +23,7 @@ from typing import List, Dict, Optional, Tuple
 
 import pandas as pd
 
-from importer import normalize_pack_type
+from importer import normalize_pack_type, detect_encoding
 
 # ── end of imports ────────────────────────────────────────────────────────────
 
@@ -236,8 +236,9 @@ def detect_format(filename: str, content_bytes: bytes) -> Dict:
 
     try:
         if ext == 'csv':
-            df = pd.read_csv(io.BytesIO(content_bytes), encoding='utf-8-sig',
-                             dtype=str, nrows=5)
+            enc = detect_encoding(content_bytes)
+            df = pd.read_csv(io.BytesIO(content_bytes), encoding=enc,
+                             encoding_errors='replace', dtype=str, nrows=5)
             # Check first column for non-numeric location strings
             has_location = bool(re.search(r'[A-Za-z]', str(df.columns[0])) and
                                 'seq' not in str(df.columns[0]).lower())
@@ -486,7 +487,9 @@ class CountImporter:
 
     def _parse_csv(self, content_bytes: bytes,
                    default_location: str = "Unspecified") -> List[CountRecord]:
-        df = pd.read_csv(io.BytesIO(content_bytes), encoding='utf-8-sig', dtype=str)
+        enc = detect_encoding(content_bytes)
+        df = pd.read_csv(io.BytesIO(content_bytes), encoding=enc,
+                         encoding_errors='replace', dtype=str)
         df.columns = [str(c).strip() for c in df.columns]
         df = df.where(pd.notna(df), None)
         return _merge_separated_df(df, location=default_location)
