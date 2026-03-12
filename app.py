@@ -18,6 +18,7 @@ from typing import Optional
 
 import streamlit as st
 import pandas as pd
+import onedrive_connector as od
 
 # ── end of stdlib + third-party imports ──────────────────────────────────────
 
@@ -45,8 +46,11 @@ from importer import InventoryImporter
 from gl_manager import GLCodeManager
 from count_importer import CountImporter, CountImportMeta
 from status_bar import status_bar
-from ui_skeleton import build_default_registry, MenuBar, SidebarConfig
-import onedrive_connector as od
+from session_state import init_session_state, reset_db_mgmt_confirm
+from ui_skeleton import (
+    build_default_registry, MenuBar, SidebarConfig,
+    DB_OPERATIONS, DEFAULT_MODE_REG
+)
 
 # ── end of local module imports ───────────────────────────────────────────────
 
@@ -1337,15 +1341,599 @@ def page_settings():
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  MAIN NAV
+#  PAGE — DATABASE MANAGEMENT
+#  Paste this function into app.py, then add the two lines noted at the
+#  bottom to wire it into main().
+#
+#  Operations covered:
+#    Backup · Restore · Duplicate · Create New · Rename / Relabel
+#    Assign Cost Center(s) · Set Variance Thresholds
+#    Clear Quantities · Clear All Items · Full Reset
+#
+#  Safety rules:
+#    • All destructive operations require a two-step confirm
+#    • Full Reset requires typing the cost center name to unlock
+#    • Clear operations show a row-count preview before confirming
+#    • Restore shows backup metadata before confirming
+# ──────────────────────────────────────────────────────────────────────────────
+
+def page_db_management():
+    from session_state import init_session_state, reset_db_mgmt_confirm
+    from ui_skeleton   import DB_OPERATIONS
+
+    init_session_state(st.session_state)
+    db = _get_db()
+
+    st.title("🗄️ Database Management")
+    st.caption("Backup, restore, configure, and maintain your inventory database.")
+
+    # ── Confirm-state helper ─────────────────────────────────────────────────
+    def _mgmt(key, default=None):
+        return st.session_state["db_mgmt"].get(key, default)
+
+    def _set_mgmt(key, val):
+        st.session_state["db_mgmt"][key] = val
+
+    # ── Tabs ─────────────────────────────────────────────────────────────────
+    tab_backup, tab_structure, tab_thresholds, tab_danger = st.tabs([
+        "💾  Backup & Restore",
+        "🏗️  Structure",
+        "🎚️  Thresholds",
+        "⚠️  Danger Zone",
+    ])
+
+    # ── end of tabs setup ─────────────────────────────────────────────────────
+
+
+    # ──────────────────────────────────────────────────────────────────────────
+    #  TAB — BACKUP & RESTORE
+    # ──────────────────────────────────────────────────────────────────────────
+
+    with tab_backup:
+        st.subheader("💾 Backup")
+
+        col_info, col_action = st.columns([2, 1])
+
+        with col_info:
+            last_ts    = _mgmt("last_backup_ts")
+            last_label = _mgmt("last_backup_label")
+            if last_ts:
+                st.success(f"Last backup: **{last_label or 'unlabeled'}** — {last_ts}")
+            else:
+                st.info("No backup on record for this session.")
+
+        with col_action:
+            backup_label = st.text_input(
+                "Backup label (optional)",
+                placeholder="e.g. pre-import 2026-03-12",
+                key="backup_label_input",
+            )
+            if st.button("💾 Create Backup Now", use_container_width=True):
+                try:
+                    ts    = datetime.now().strftime("%Y-%m-%d %H:%M")
+                    label = backup_label.strip() or f"backup {ts}"
+                    # Export full items table to JSON stored in Streamlit state
+                    items = db.get_all_items(None)
+                    import json
+                    snapshot = {
+                        "label":     label,
+                        "ts":        ts,
+                        "item_count": len(items),
+                        "items":     items,
+                    }
+                    if "db_backups" not in st.session_state:
+                        st.session_state["db_backups"] = []
+                    st.session_state["db_backups"].append(snapshot)
+                    _set_mgmt("last_backup_ts",    ts)
+                    _set_mgmt("last_backup_label", label)
+                    st.success(f"✅ Backup created: **{label}** ({len(items)} items)")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Backup failed: {e}")
+
+        st.markdown("---")
+        st.subheader("⬇️ Download Backup")
+
+        items_all = db.get_all_items(None)
+        if items_all:
+            import json, io as _io
+            dl_label = backup_label.strip() if 'backup_label_input' in st.session_state else "backup"
+            dl_bytes = json.dumps(items_all, indent=2, default=str).encode()
+            st.download_button(
+                label    = "⬇️ Download as JSON",
+                data     = dl_bytes,
+                file_name= f"uha_inventory_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
+                mime     = "application/json",
+                use_container_width=True,
+            )
+            df_export = pd.DataFrame(items_all)
+            csv_bytes = df_export.to_csv(index=False).encode()
+            st.download_button(
+                label    = "⬇️ Download as CSV",
+                data     = csv_bytes,
+                file_name= f"uha_inventory_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                mime     = "text/csv",
+                use_container_width=True,
+            )
+        else:
+            st.info("No items in database to export.")
+
+        st.markdown("---")
+        st.subheader("⏪ Restore from Session Backup")
+
+        backups = st.session_state.get("db_backups", [])
+        if not backups:
+            st.info("No session backups available. Create a backup above first.")
+        else:
+            options = {f"{b['label']} ({b['item_count']} items — {b['ts']})": i
+                       for i, b in enumerate(backups)}
+            chosen_label = st.selectbox(
+                "Select backup to restore",
+                options=list(options.keys()),
+                key="restore_select",
+            )
+            chosen_idx = options[chosen_label]
+            chosen     = backups[chosen_idx]
+
+            st.warning(
+                f"⚠️ Restoring **{chosen['label']}** will overwrite all "
+                f"{chosen['item_count']} items currently in the database."
+            )
+
+            confirmed = _mgmt("restore_confirmed", False)
+            if not confirmed:
+                if st.button("🔓 Unlock Restore", type="secondary"):
+                    _set_mgmt("restore_confirmed", True)
+                    st.rerun()
+            else:
+                col_go, col_cancel = st.columns(2)
+                with col_go:
+                    if st.button("⏪ Confirm Restore", type="primary",
+                                 use_container_width=True):
+                        try:
+                            # Restore: clear items table, re-insert from snapshot
+                            with db.get_conn() as conn:  # type: ignore
+                                cur = conn.cursor()
+                                cur.execute("DELETE FROM items")
+                            for item in chosen["items"]:
+                                try:
+                                    db.add_item(item, changed_by="restore")
+                                except Exception:
+                                    db.upsert_item(item, changed_by="restore")
+                            reset_db_mgmt_confirm(st.session_state)
+                            st.success(
+                                f"✅ Restored {len(chosen['items'])} items "
+                                f"from **{chosen['label']}**"
+                            )
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Restore failed: {e}")
+                with col_cancel:
+                    if st.button("Cancel", use_container_width=True):
+                        reset_db_mgmt_confirm(st.session_state)
+                        st.rerun()
+
+    # ── end of tab — backup & restore ─────────────────────────────────────────
+
+
+    # ──────────────────────────────────────────────────────────────────────────
+    #  TAB — STRUCTURE  (rename, cost center, duplicate, create new)
+    # ──────────────────────────────────────────────────────────────────────────
+
+    with tab_structure:
+
+        # ── Current database info ────────────────────────────────────────────
+        st.subheader("📊 Current Database")
+        try:
+            total_items   = db.count_items(None)
+            active_items  = db.count_items("active")
+            total_value   = db.get_inventory_value()
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Total Records",  f"{total_items:,}")
+            col2.metric("Active Items",   f"{active_items:,}")
+            col3.metric("Inventory Value",f"${total_value:,.2f}")
+        except Exception as e:
+            st.error(f"Could not read DB stats: {e}")
+
+        st.markdown("---")
+
+        # ── Rename / Relabel ─────────────────────────────────────────────────
+        st.subheader("✏️ Rename / Relabel")
+        sidebar_cfg = st.session_state.get("_sidebar_cfg")
+        current_label = sidebar_cfg.custom_label if sidebar_cfg else "UHA TDECU Stadium"
+
+        new_label = st.text_input(
+            "Display name (shown in sidebar + reports)",
+            value=current_label,
+            key="db_rename_input",
+        )
+        if st.button("Apply Label", key="db_rename_apply"):
+            if sidebar_cfg and new_label.strip():
+                sidebar_cfg.custom_label = new_label.strip()
+                st.session_state["_sidebar_cfg"] = sidebar_cfg
+                st.success(f"✅ Label updated to: **{new_label.strip()}**")
+                st.rerun()
+
+        st.markdown("---")
+
+        # ── Cost Center Assignment ───────────────────────────────────────────
+        st.subheader("🏷️ Cost Center Assignment")
+        st.caption(
+            "Assign this database to one or more cost center keys. "
+            "The active cost center controls which DB connection is used for imports."
+        )
+
+        current_cc = st.session_state["db"].get("cost_center", "default")
+        st.info(f"Active cost center: **{current_cc}**")
+
+        new_cc_name = st.text_input(
+            "New cost center name",
+            value=_mgmt("pending_cc_name", ""),
+            placeholder="e.g. TDECU Stadium",
+            key="cc_name_input",
+        )
+        new_cc_key = re.sub(r'[^a-z0-9_]', '_',
+                            new_cc_name.strip().lower()).strip('_')
+        if new_cc_name.strip():
+            st.caption(f"Key will be: `{new_cc_key}`")
+
+        new_cc_desc = st.text_input(
+            "Description (optional)",
+            value=_mgmt("pending_cc_desc", ""),
+            placeholder="e.g. UHA TDECU Stadium — Compass 57231",
+            key="cc_desc_input",
+        )
+
+        col_add, col_switch = st.columns(2)
+        with col_add:
+            if st.button("➕ Register Cost Center", use_container_width=True):
+                if new_cc_key:
+                    available = st.session_state["db"].get("available", [])
+                    if not any(cc["key"] == new_cc_key for cc in available):
+                        available.append({
+                            "key":         new_cc_key,
+                            "name":        new_cc_name.strip(),
+                            "description": new_cc_desc.strip(),
+                        })
+                        st.session_state["db"]["available"] = available
+                    st.success(f"✅ Cost center registered: **{new_cc_key}**")
+                    st.rerun()
+
+        with col_switch:
+            available = st.session_state["db"].get("available", [])
+            cc_options = [cc["key"] for cc in available] or [current_cc]
+            selected_cc = st.selectbox(
+                "Switch active cost center",
+                options=cc_options,
+                index=cc_options.index(current_cc) if current_cc in cc_options else 0,
+                key="cc_switch_select",
+            )
+            if st.button("🔀 Switch", use_container_width=True):
+                st.session_state["db"]["cost_center"] = selected_cc
+                st.success(f"✅ Active cost center → **{selected_cc}**")
+                st.rerun()
+
+        st.markdown("---")
+
+        # ── Duplicate / Create New ───────────────────────────────────────────
+        st.subheader("📋 Duplicate or Create New Database")
+        col_dup, col_new = st.columns(2)
+
+        with col_dup:
+            st.markdown("**Duplicate current database**")
+            st.caption("Clone all items to a new cost center.")
+            dup_target = st.text_input(
+                "Target cost center key",
+                placeholder="e.g. tdecu_copy",
+                key="dup_target_input",
+            )
+            if st.button("📋 Duplicate", use_container_width=True, key="dup_btn"):
+                if dup_target.strip():
+                    try:
+                        items = db.get_all_items(None)
+                        duped = 0
+                        for item in items:
+                            item_copy = dict(item)
+                            item_copy["cost_center"] = dup_target.strip()
+                            # Key stays the same — cost_center is metadata only
+                            try:
+                                db.add_item(item_copy, changed_by="duplicate")
+                                duped += 1
+                            except Exception:
+                                pass
+                        st.success(f"✅ Duplicated {duped} items → **{dup_target.strip()}**")
+                    except Exception as e:
+                        st.error(f"Duplicate failed: {e}")
+                else:
+                    st.warning("Enter a target cost center key first.")
+
+        with col_new:
+            st.markdown("**Create new empty database**")
+            st.caption("Register a new cost center with no items.")
+            new_db_key = st.text_input(
+                "New cost center key",
+                placeholder="e.g. softball_complex",
+                key="new_db_key_input",
+            )
+            if st.button("➕ Create Empty", use_container_width=True, key="new_db_btn"):
+                if new_db_key.strip():
+                    available = st.session_state["db"].get("available", [])
+                    key_clean = re.sub(r'[^a-z0-9_]', '_',
+                                       new_db_key.strip().lower()).strip('_')
+                    if not any(cc["key"] == key_clean for cc in available):
+                        available.append({
+                            "key":         key_clean,
+                            "name":        new_db_key.strip(),
+                            "description": "New cost center",
+                        })
+                        st.session_state["db"]["available"] = available
+                        st.success(f"✅ New cost center created: **{key_clean}**")
+                        st.rerun()
+                    else:
+                        st.warning(f"Cost center **{key_clean}** already exists.")
+                else:
+                    st.warning("Enter a cost center key first.")
+
+    # ── end of tab — structure ────────────────────────────────────────────────
+
+
+    # ──────────────────────────────────────────────────────────────────────────
+    #  TAB — THRESHOLDS
+    # ──────────────────────────────────────────────────────────────────────────
+
+    with tab_thresholds:
+        st.subheader("🎚️ Variance Flagging Thresholds")
+        st.caption(
+            "Items are flagged during count import when their variance exceeds "
+            "either of these thresholds. Lower values = more flags. "
+            "These apply to the active cost center."
+        )
+
+        thresholds = st.session_state["db_mgmt"]["thresholds"]
+
+        col_each, col_val = st.columns(2)
+
+        with col_each:
+            new_flag_each = st.number_input(
+                "Flag if |unit variance| exceeds",
+                min_value=0,
+                max_value=10000,
+                value=int(thresholds.get("flag_each", 24)),
+                step=1,
+                help="Example: 24 means flag if item count differs by more than 24 units.",
+                key="threshold_each_input",
+            )
+
+        with col_val:
+            new_flag_value = st.number_input(
+                "Flag if |value variance| exceeds ($)",
+                min_value=0.0,
+                max_value=100000.0,
+                value=float(thresholds.get("flag_value", 50.0)),
+                step=5.0,
+                format="%.2f",
+                help="Example: 50.00 means flag if variance dollar amount exceeds $50.",
+                key="threshold_value_input",
+            )
+
+        # Preview impact
+        st.markdown("---")
+        st.caption("**Current thresholds at a glance:**")
+        c1, c2 = st.columns(2)
+        c1.metric("Unit threshold",  f"± {new_flag_each} units")
+        c2.metric("Value threshold", f"± ${new_flag_value:,.2f}")
+
+        if st.button("💾 Save Thresholds", type="primary"):
+            st.session_state["db_mgmt"]["thresholds"] = {
+                "flag_each":  new_flag_each,
+                "flag_value": new_flag_value,
+            }
+            st.success(
+                f"✅ Thresholds saved — "
+                f"units: ±{new_flag_each} · value: ±${new_flag_value:,.2f}"
+            )
+
+        st.markdown("---")
+        st.subheader("ℹ️ What Gets Flagged")
+        st.markdown("""
+| Condition | Flag Reason |
+|---|---|
+| Item not found in DB | Item not found in database |
+| unit variance > threshold | Unit variance exceeds threshold |
+| value variance > threshold | Value variance exceeds threshold |
+
+Flagged items appear in the count import review panel with a 🚩 indicator.
+They are **not blocked** from import — the flag is informational.
+        """)
+
+    # ── end of tab — thresholds ───────────────────────────────────────────────
+
+
+    # ──────────────────────────────────────────────────────────────────────────
+    #  TAB — DANGER ZONE
+    # ──────────────────────────────────────────────────────────────────────────
+
+    with tab_danger:
+        st.error(
+            "⚠️ All operations in this section modify or destroy data. "
+            "Create a backup before proceeding."
+        )
+
+        # ── Clear Quantities ─────────────────────────────────────────────────
+        with st.expander("🔢 Clear All Quantities", expanded=False):
+            st.warning(
+                "Sets **quantity_on_hand = 0** for every active item. "
+                "Item records, prices, GL codes, and history are preserved."
+            )
+            try:
+                active_count = db.count_items("active")
+                st.caption(f"Will affect **{active_count:,}** active items.")
+            except Exception:
+                pass
+
+            confirmed_qty = _mgmt("clear_confirmed") and _mgmt("clear_scope") == "quantities"
+
+            if not confirmed_qty:
+                if st.button("🔓 Unlock — Clear Quantities",
+                             key="unlock_clear_qty", type="secondary"):
+                    _set_mgmt("clear_confirmed", True)
+                    _set_mgmt("clear_scope",     "quantities")
+                    st.rerun()
+            else:
+                col_go, col_cancel = st.columns(2)
+                with col_go:
+                    if st.button("🔢 Confirm — Zero All Quantities",
+                                 key="confirm_clear_qty", type="primary",
+                                 use_container_width=True):
+                        try:
+                            with db.get_conn() as conn:  # type: ignore
+                                cur = conn.cursor()
+                                cur.execute(
+                                    "UPDATE items SET quantity_on_hand = 0 "
+                                    "WHERE record_status = 'active'"
+                                )
+                                affected = cur.rowcount
+                            reset_db_mgmt_confirm(st.session_state)
+                            st.success(f"✅ Zeroed quantities on {affected:,} items.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Operation failed: {e}")
+                with col_cancel:
+                    if st.button("Cancel", key="cancel_clear_qty",
+                                 use_container_width=True):
+                        reset_db_mgmt_confirm(st.session_state)
+                        st.rerun()
+
+        # ── Clear All Items ──────────────────────────────────────────────────
+        with st.expander("🗑️ Clear All Items", expanded=False):
+            st.error(
+                "Removes **all item records** from the database. "
+                "GL code mappings, import logs, and cost center config are preserved. "
+                "This cannot be undone without a backup."
+            )
+            try:
+                total_count = db.count_items(None)
+                st.caption(f"Will delete **{total_count:,}** total item records.")
+            except Exception:
+                pass
+
+            confirmed_all = _mgmt("clear_confirmed") and _mgmt("clear_scope") == "all_items"
+
+            if not confirmed_all:
+                if st.button("🔓 Unlock — Clear All Items",
+                             key="unlock_clear_all", type="secondary"):
+                    _set_mgmt("clear_confirmed", True)
+                    _set_mgmt("clear_scope",     "all_items")
+                    st.rerun()
+            else:
+                col_go, col_cancel = st.columns(2)
+                with col_go:
+                    if st.button("🗑️ Confirm — Delete All Items",
+                                 key="confirm_clear_all", type="primary",
+                                 use_container_width=True):
+                        try:
+                            with db.get_conn() as conn:  # type: ignore
+                                cur = conn.cursor()
+                                cur.execute("DELETE FROM items")
+                                affected = cur.rowcount
+                            reset_db_mgmt_confirm(st.session_state)
+                            st.success(f"✅ Deleted {affected:,} item records.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Operation failed: {e}")
+                with col_cancel:
+                    if st.button("Cancel", key="cancel_clear_all",
+                                 use_container_width=True):
+                        reset_db_mgmt_confirm(st.session_state)
+                        st.rerun()
+
+        # ── Full Reset ───────────────────────────────────────────────────────
+        with st.expander("☢️ Full Reset", expanded=False):
+            st.error(
+                "**Wipes the entire database** — all items, history, import logs, "
+                "and variance records. GL code mappings are also cleared. "
+                "This is irreversible without a backup."
+            )
+            current_cc = st.session_state["db"].get("cost_center", "default")
+            st.caption(
+                f"To confirm, type the active cost center name exactly: "
+                f"**`{current_cc}`**"
+            )
+
+            reset_confirm_text = st.text_input(
+                "Type cost center name to unlock",
+                key="full_reset_confirm_input",
+                placeholder=current_cc,
+            )
+            unlock_ready = reset_confirm_text.strip() == current_cc.strip()
+
+            if not unlock_ready:
+                st.button("☢️ Full Reset", disabled=True,
+                          key="full_reset_btn_disabled",
+                          help="Type the cost center name above to enable.")
+            else:
+                confirmed_reset = _mgmt("clear_confirmed") and \
+                                  _mgmt("clear_scope") == "full_reset"
+                if not confirmed_reset:
+                    if st.button("🔓 Unlock Full Reset",
+                                 key="unlock_full_reset", type="secondary"):
+                        _set_mgmt("clear_confirmed", True)
+                        _set_mgmt("clear_scope",     "full_reset")
+                        st.rerun()
+                else:
+                    col_go, col_cancel = st.columns(2)
+                    with col_go:
+                        if st.button("☢️ Confirm Full Reset",
+                                     key="confirm_full_reset", type="primary",
+                                     use_container_width=True):
+                            try:
+                                with db.get_conn() as conn:  # type: ignore
+                                    cur = conn.cursor()
+                                    cur.execute("DELETE FROM count_variance_detail")
+                                    cur.execute("DELETE FROM count_imports")
+                                    cur.execute("DELETE FROM item_history")
+                                    cur.execute("DELETE FROM price_history")
+                                    cur.execute("DELETE FROM import_log")
+                                    cur.execute("DELETE FROM items")
+                                reset_db_mgmt_confirm(st.session_state)
+                                st.success("✅ Full reset complete. Database is empty.")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Full reset failed: {e}")
+                    with col_cancel:
+                        if st.button("Cancel", key="cancel_full_reset",
+                                     use_container_width=True):
+                            reset_db_mgmt_confirm(st.session_state)
+                            st.rerun()
+
+    # ── end of tab — danger zone ──────────────────────────────────────────────
+
+# ── end of page — database management ────────────────────────────────────────
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  MAIN NAV — UPDATED ROUTER
+#  Replace the existing main() function in app.py with this version.
+#  Changes from original:
+#    1. init_session_state() called once at bootstrap
+#    2. db_management and import_mode_selector routes added
+#    3. sidebar nav gets Database and Mode Selector entries
 # ──────────────────────────────────────────────────────────────────────────────
 
 def main():
-    # ── Bootstrap registry + sidebar config (once per session) ───────────────
+    from session_state import init_session_state
+    from ui_skeleton   import (build_default_registry, MenuBar,
+                                SidebarConfig, DEFAULT_MODE_REG)
+
+    # ── Bootstrap (once per session) ─────────────────────────────────────────
     if "_registry" not in st.session_state:
-        st.session_state["_registry"] = build_default_registry()
+        st.session_state["_registry"]    = build_default_registry()
     if "_sidebar_cfg" not in st.session_state:
         st.session_state["_sidebar_cfg"] = SidebarConfig()
+    if "_mode_reg" not in st.session_state:
+        st.session_state["_mode_reg"]    = DEFAULT_MODE_REG
+
+    init_session_state(st.session_state)
 
     reg         = st.session_state["_registry"]
     sidebar_cfg = st.session_state["_sidebar_cfg"]
@@ -1355,26 +1943,29 @@ def main():
     status_bar.inject_topnav(menubar, sidebar_visible=sidebar_cfg.visible)
     status_bar.inject_footer()
 
-    # ── Determine current page from query params ──────────────────────────────
+    # ── Determine current page ────────────────────────────────────────────────
     page = st.query_params.get("page", "dashboard")
 
-    # ── Sidebar (optional) ────────────────────────────────────────────────────
+    # ── Sidebar ───────────────────────────────────────────────────────────────
     if sidebar_cfg.visible:
         with st.sidebar:
             if sidebar_cfg.show_cost_center:
+                cc = st.session_state["db"].get("cost_center", "default")
                 st.markdown(f"**{sidebar_cfg.custom_label}**")
+                st.caption(f"Cost center: `{cc}`")
                 st.markdown("---")
+
             if sidebar_cfg.show_nav:
-                # key = query param value, flag = registry key to check
                 nav_items = [
-                    ("🏠 Dashboard",     "dashboard",    "dashboard"),
-                    ("📦 Inventory",     "inventory",    "inventory"),
-                    ("📥 Import",        "import",       "vendor_import"),
-                    ("📋 Count Import",  "count_import", "count_import"),
-                    ("🏷️  GL Codes",      "gl_codes",     "gl_codes"),
-                    ("📜 History",       "history",      "history"),
-                    ("📤 Export",        "export",       "export"),
-                    ("⚙️  Settings",      "settings",     "settings"),
+                    ("🏠 Dashboard",      "dashboard",       "dashboard"),
+                    ("📦 Inventory",      "inventory",       "inventory"),
+                    ("📥 Import",         "import",          "vendor_import"),
+                    ("📋 Count Import",   "count_import",    "count_import"),
+                    ("🏷️  GL Codes",       "gl_codes",        "gl_codes"),
+                    ("📜 History",        "history",         "history"),
+                    ("📤 Export",         "export",          "export"),
+                    ("🗄️  Database",       "db_management",   "db_management"),
+                    ("⚙️  Settings",       "settings",        "settings"),
                 ]
                 for label, page_key, flag_key in nav_items:
                     if reg.is_enabled(flag_key):
@@ -1386,20 +1977,22 @@ def main():
     onedrive_auth_sidebar()
 
     # ── Route to page ─────────────────────────────────────────────────────────
-    if   page == "dashboard":       page_dashboard()
-    elif page == "inventory":       page_inventory()
-    elif page == "import":          page_import()
-    elif page == "count_import":    page_count_import()
-    elif page == "gl_codes":        page_gl_codes()
-    elif page == "history":         page_history()
-    elif page == "export":          page_export()
+    if   page == "dashboard":        page_dashboard()
+    elif page == "inventory":        page_inventory()
+    elif page == "import":           page_import()
+    elif page == "count_import":     page_count_import()
+    elif page == "gl_codes":         page_gl_codes()
+    elif page == "history":          page_history()
+    elif page == "export":           page_export()
+    elif page == "db_management":    page_db_management()
     elif page in ("settings",
                   "settings_sidebar",
-                  "settings_prefs"): page_settings()
-    else:                           page_dashboard()
+                  "settings_prefs"):  page_settings()
+    else:                            page_dashboard()
 
 
 if __name__ == "__main__":
     main()
+
 
 # ── end of main nav ───────────────────────────────────────────────────────────
