@@ -32,7 +32,7 @@ from importer import normalize_pack_type, detect_encoding
 #  VERSION
 # ──────────────────────────────────────────────────────────────────────────────
 
-__version__ = "3.0.1"
+__version__ = "3.0.2"
 
 # ── end of version ────────────────────────────────────────────────────────────
 
@@ -758,15 +758,20 @@ class CountImporter:
 
             # ── Resolve conv_ratio ───────────────────────────────────────────
             #  Priority:
-            #    1. DB conv_ratio if set and > 0
+            #    1. DB conv_ratio if explicitly set (> 1) — manual override wins
             #    2. Leading integer in pack_type string  ("12/24oz CAN" → 12)
-            #    3. Default = 1  — null/zero NEVER silently drops case qty
+            #    3. Default = 1  — never silently drops case qty
+            #
+            #  NOTE: conv_ratio = 1 in DB is treated as "not set" because the
+            #  schema default is 1, making it indistinguishable from an explicit
+            #  entry.  Pack_type extraction is the authoritative source for all
+            #  standard N/unit formats.
             conv = None
 
             if in_db:
                 try:
                     db_conv = float(db_item.get("conv_ratio") or 0)
-                    if db_conv > 0:
+                    if db_conv > 1:   # > 1, not > 0 — skip schema default of 1
                         conv = db_conv
                 except (ValueError, TypeError):
                     pass
