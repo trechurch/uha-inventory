@@ -2301,6 +2301,7 @@ def main():
                 "app", "database", "importer",
                 "count_importer", "gl_manager",
                 "ui_skeleton", "session_state", "status_bar",
+                "count_sheet_generator", "page_count_sheets",
             ]
             for _name in _modules:
                 try:
