@@ -32,7 +32,7 @@ from importer import normalize_pack_type, detect_encoding
 #  VERSION
 # ──────────────────────────────────────────────────────────────────────────────
 
-__version__ = "3.0.4"
+__version__ = "3.0.5"
 
 # ── end of version ────────────────────────────────────────────────────────────
 
@@ -750,7 +750,14 @@ class CountImporter:
         # ── Single bulk fetch ────────────────────────────────────────────────
         all_keys    = list({r.item_key for r in records})
         db_map      = self.db.get_items_bulk(all_keys)        # {key: item_dict}
-        override_map = self.db.get_count_overrides_bulk(all_keys)  # {key: override_dict}
+        
+        # Fetch count overrides (may not exist on first run before table creation)
+        try:
+            override_map = self.db.get_count_overrides_bulk(all_keys)  # {key: override_dict}
+        except (AttributeError, Exception) as e:
+            # Table doesn't exist yet or method not found — proceed without overrides
+            print(f"Count overrides not available (expected on first run): {e}")
+            override_map = {}
 
         # ── In-memory diff ───────────────────────────────────────────────────
         variance_list: List[VarianceRecord] = []
