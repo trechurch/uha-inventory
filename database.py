@@ -18,7 +18,7 @@ from contextlib import contextmanager
 #  VERSION
 # ──────────────────────────────────────────────────────────────────────────────
 
-__version__ = "3.0.2"
+__version__ = "3.0.3"
 
 # ── end of version ────────────────────────────────────────────────────────────
 
@@ -749,19 +749,26 @@ class InventoryDatabase:
         """
         if not keys:
             return {}
-        with get_conn() as conn:
-            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-            cur.execute("""
-                SELECT DISTINCT ON (item_key)
-                    item_key, cost_center, divisor, case_behavior, notes
-                FROM count_overrides
-                WHERE item_key = ANY(%s)
-                  AND is_active = TRUE
-                  AND (cost_center = %s OR cost_center = '*')
-                ORDER BY item_key,
-                         CASE WHEN cost_center = %s THEN 0 ELSE 1 END
-            """, (list(keys), cost_center, cost_center))
-            return {row["item_key"]: dict(row) for row in cur.fetchall()}
+        try:
+            with get_conn() as conn:
+                cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+                cur.execute("""
+                    SELECT DISTINCT ON (item_key)
+                        item_key, cost_center, divisor, case_behavior, notes
+                    FROM count_overrides
+                    WHERE item_key = ANY(%s)
+                      AND is_active = TRUE
+                      AND (cost_center = %s OR cost_center = '*')
+                    ORDER BY item_key,
+                             CASE WHEN cost_center = %s THEN 0 ELSE 1 END
+                """, (list(keys), cost_center, cost_center))
+                return {row["item_key"]: dict(row) for row in cur.fetchall()}
+        except psycopg2.errors.UndefinedTable:
+            # Table doesn't exist yet (first run before create_tables has executed)
+            return {}
+        except Exception as e:
+            print(f"Error fetching count overrides: {e}")
+            return {}
 
     def upsert_count_override(self, item_key: str, divisor: float,
                                case_behavior: str = "ignore",
