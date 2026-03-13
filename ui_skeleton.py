@@ -13,15 +13,13 @@ from typing import Dict, List, Callable, Optional, Any
 #  VERSION
 # ──────────────────────────────────────────────────────────────────────────────
 
-__version__ = "3.0.0"
+__version__ = "3.0.1"
 
 # ── end of version ────────────────────────────────────────────────────────────
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  FEATURE TOGGLE + REGISTRY
-#  Unchanged from Tkinter prototype — no Streamlit dependency here.
-#  option_available=False → item renders greyed out and non-interactive.
 # ──────────────────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -55,30 +53,35 @@ class FeatureRegistry:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  MENU ITEM  —  extended from prototype for Streamlit top-nav
+#  MENU ITEM
+#
+#  page_key   → renders as a plain href="?page=<key>" link (no JS needed,
+#               works inside Streamlit's iframe without restriction)
+#  js_action  → renders as an onclick= handler for browser-native calls
+#               (window.open, window.print, navigator.share, etc.)
+#               These two are mutually exclusive — page_key wins if both set.
 # ──────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class MenuItem:
     label:        str
-    page_key:     str              = ""      # st.query_params target
-    icon:         str              = ""      # emoji prefix
-    action:       Optional[Callable] = None  # legacy Tkinter hook
-    feature_flag: str              = ""      # registry key; "" = always on
-    separator:    bool             = False   # render a divider before this item
-    children:     List["MenuItem"] = field(default_factory=list)  # submenu
+    page_key:     str               = ""
+    js_action:    str               = ""      # raw JS for browser-native actions
+    icon:         str               = ""
+    action:       Optional[Callable] = None
+    feature_flag: str               = ""
+    separator:    bool              = False
+    children:     List["MenuItem"]  = field(default_factory=list)
 
     @property
     def full_label(self) -> str:
-        return f"{self.icon}  {self.label}" if self.icon else self.label
+        return f"{self.icon} &nbsp;{self.label}" if self.icon else self.label
 
 # ── end of menu item ──────────────────────────────────────────────────────────
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  MENU BAR DEFINITION
-#  Single source of truth for all top-nav menus and their items.
-#  Items with feature_flag set to a disabled feature render greyed out.
 # ──────────────────────────────────────────────────────────────────────────────
 
 class MenuBar:
@@ -89,41 +92,108 @@ class MenuBar:
 
     def _build(self) -> List[MenuItem]:
         return [
+
             # ── File ─────────────────────────────────────────────────────────
             MenuItem(label="File", children=[
-                MenuItem("Export Inventory", page_key="export",
-                         icon="📤", feature_flag="export"),
+
+                # ── Browser-native (JS only, no page routing) ─────────────────
+                MenuItem("New Tab",
+                         icon="🗋",
+                         js_action="window.open(window.location.href,'_blank');"),
+                MenuItem("Duplicate Tab",
+                         icon="⧉",
+                         js_action="window.open(window.location.href,'_blank');"),
+                MenuItem("New Window",
+                         icon="⬜",
+                         js_action="window.open(window.location.href,'_blank','width=1400,height=900');"),
+
                 MenuItem("", separator=True),
-                MenuItem("Settings",         page_key="settings",
-                         icon="⚙️",  feature_flag="settings"),
+
+                # ── Database operations → db_management page ──────────────────
+                MenuItem("New Database",    page_key="db_management", icon="➕",
+                         feature_flag="db_management"),
+                MenuItem("Open Database",   page_key="db_management", icon="📂",
+                         feature_flag="db_management"),
+                MenuItem("Edit Database",   page_key="db_management", icon="✏️",
+                         feature_flag="db_management"),
+                MenuItem("Save as Database",page_key="db_management", icon="💾",
+                         feature_flag="db_management"),
+                MenuItem("Save Database",   page_key="db_management", icon="🖫",
+                         feature_flag="db_management"),
+
+                MenuItem("", separator=True),
+
+                # ── Share / Print / Export ────────────────────────────────────
+                MenuItem("Share",
+                         icon="↗",
+                         js_action=(
+                             "if(navigator.share){"
+                             "  navigator.share({title:'UHA Inventory',url:window.location.href})"
+                             "} else {"
+                             "  navigator.clipboard.writeText(window.location.href);"
+                             "  alert('Link copied to clipboard');"
+                             "}"
+                         )),
+                MenuItem("Print",
+                         icon="🖨",
+                         js_action="window.print();"),
+                MenuItem("Export",          page_key="export",         icon="📤",
+                         feature_flag="export"),
+
+                MenuItem("", separator=True),
+
+                # ── History ───────────────────────────────────────────────────
+                MenuItem("History",         page_key="history",        icon="📜",
+                         feature_flag="history"),
+
+                MenuItem("", separator=True),
+
+                # ── Window / tab controls ─────────────────────────────────────
+                MenuItem("Close Tab",
+                         icon="✕",
+                         js_action="window.close();"),
+                MenuItem("Close Window",
+                         icon="⊠",
+                         js_action="window.close();"),
+                MenuItem("Exit",
+                         icon="⏻",
+                         js_action=(
+                             "if(confirm('Close UHA Inventory?')){"
+                             "  window.close();"
+                             "}"
+                         )),
             ]),
 
             # ── Inventory ────────────────────────────────────────────────────
             MenuItem(label="Inventory", children=[
-                MenuItem("Items",    page_key="inventory",
-                         icon="📦", feature_flag="inventory"),
-                MenuItem("History",  page_key="history",
-                         icon="📜", feature_flag="history"),
-                MenuItem("GL Codes", page_key="gl_codes",
-                         icon="🏷️",  feature_flag="gl_codes"),
+                MenuItem("Dashboard",  page_key="dashboard",  icon="🏠",
+                         feature_flag="dashboard"),
+                MenuItem("Items",      page_key="inventory",  icon="📦",
+                         feature_flag="inventory"),
+                MenuItem("GL Codes",   page_key="gl_codes",   icon="🏷️",
+                         feature_flag="gl_codes"),
+                MenuItem("History",    page_key="history",    icon="📜",
+                         feature_flag="history"),
+                MenuItem("Export",     page_key="export",     icon="📤",
+                         feature_flag="export"),
             ]),
 
             # ── Import ───────────────────────────────────────────────────────
             MenuItem(label="Import", children=[
-                MenuItem("Vendor Invoice",  page_key="import",
+                MenuItem("Vendor Invoice",          page_key="import",
                          icon="📥", feature_flag="vendor_import"),
-                MenuItem("Count Import",    page_key="count_import",
+                MenuItem("Count Import",             page_key="count_import",
                          icon="📋", feature_flag="count_import"),
-                MenuItem("Compare Files",   page_key="compare_counts",
+                MenuItem("Compare Files",            page_key="compare_counts",
                          icon="📊", feature_flag="compare_counts"),
-                MenuItem("Override & Rule Manager", page_key="count_overrides",
+                MenuItem("Override & Rule Manager",  page_key="count_overrides",
                          icon="⚙️"),
                 MenuItem("", separator=True),
-                MenuItem("Import Mode...",  page_key="import_mode_selector",
+                MenuItem("Import Mode...",           page_key="import_mode_selector",
                          icon="🧩", feature_flag="import_mode_selector"),
             ]),
 
-            # ── Tools (future — all gated) ───────────────────────────────────
+            # ── Tools ────────────────────────────────────────────────────────
             MenuItem(label="Tools", children=[
                 MenuItem("PCA Creator",       page_key="pca",
                          icon="🧪", feature_flag="pca_engine"),
@@ -139,14 +209,14 @@ class MenuBar:
 
             # ── Settings ─────────────────────────────────────────────────────
             MenuItem(label="Settings", children=[
-                MenuItem("Feature Toggles", page_key="settings",
+                MenuItem("Feature Toggles",  page_key="settings",
                          icon="🔧", feature_flag="settings"),
-                MenuItem("Sidebar",         page_key="settings_sidebar",
+                MenuItem("Sidebar",          page_key="settings_sidebar",
                          icon="◀️",  feature_flag="settings"),
-                MenuItem("Preferences",     page_key="settings_prefs",
+                MenuItem("Preferences",      page_key="settings_prefs",
                          icon="👤", feature_flag="settings"),
                 MenuItem("", separator=True),
-                MenuItem("Database...",     page_key="db_management",
+                MenuItem("Database...",      page_key="db_management",
                          icon="🗄️",  feature_flag="db_management"),
             ]),
         ]
@@ -166,10 +236,10 @@ class MenuBar:
 @dataclass
 class SidebarConfig:
     visible:          bool = True
-    show_nav:         bool = True    # show page quick-links
-    show_cost_center: bool = True    # show active cost center badge
-    show_recent:      bool = True    # show recent imports list
-    show_mode_widget: bool = True    # show import mode selector widget
+    show_nav:         bool = True
+    show_cost_center: bool = True
+    show_recent:      bool = True
+    show_mode_widget: bool = True
     custom_label:     str  = "UHA TDECU Stadium"
 
 # ── end of sidebar config ─────────────────────────────────────────────────────
@@ -177,16 +247,6 @@ class SidebarConfig:
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  IMPORT MODE — PIPELINE STEP DESCRIPTOR
-#
-#  Describes a single composable step in the import pipeline.
-#  Used by ModeRegistry and the managed-mode grid renderer.
-#
-#    timing:     "flexible" → user assigns order number
-#                "fixed"    → always runs at its natural pipeline position,
-#                             renders as a checkbox only
-#    repeatable: True → selecting again offers a second-pass slot rather
-#                       than deselecting
-#    sub_options: optional expandable options (e.g. cluster similarity axes)
 # ──────────────────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -194,7 +254,7 @@ class PipelineStep:
     key:         str
     label:       str
     icon:        str  = ""
-    timing:      str  = "flexible"    # "flexible" | "fixed"
+    timing:      str  = "flexible"
     repeatable:  bool = False
     description: str  = ""
     sub_options: List[Dict[str, Any]] = field(default_factory=list)
@@ -204,10 +264,6 @@ class PipelineStep:
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  IMPORT MODE DESCRIPTOR
-#
-#  One entry for each of the 5 named modes.
-#  pipeline_steps lists which managed-mode steps this mode contributes
-#  when it is part of a Combined or Managed pipeline.
 # ──────────────────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -216,16 +272,13 @@ class ImportMode:
     label:           str
     icon:            str  = ""
     description:     str  = ""
-    pipeline_steps:  List[str] = field(default_factory=list)  # PipelineStep keys
+    pipeline_steps:  List[str] = field(default_factory=list)
 
 # ── end of import mode descriptor ────────────────────────────────────────────
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  MODE REGISTRY
-#  Single source of truth for all named modes and all pipeline steps.
-#  The UI reads from here — adding a new mode or step means editing this
-#  file only, not hunting through page code.
 # ──────────────────────────────────────────────────────────────────────────────
 
 class ModeRegistry:
@@ -236,39 +289,21 @@ class ModeRegistry:
         self._build_steps()
         self._build_modes()
 
-    # ──────────────────────────────────────────────────────────────────────────
-    #  PIPELINE STEPS
-    # ──────────────────────────────────────────────────────────────────────────
-
     def _build_steps(self):
         steps = [
-
-            # ── Flexible steps (user assigns order) ──────────────────────────
-
             PipelineStep(
-                key         = "duplicate_detection",
-                label       = "Duplicate Detection",
-                icon        = "🔍",
-                timing      = "flexible",
-                repeatable  = False,
-                description = "Find exact and near-duplicate records before ingestion.",
+                key="duplicate_detection", label="Duplicate Detection", icon="🔍",
+                timing="flexible", description="Find exact and near-duplicate records before ingestion.",
             ),
             PipelineStep(
-                key         = "error_filter",
-                label       = "Error Filter",
-                icon        = "🚨",
-                timing      = "flexible",
-                repeatable  = False,
-                description = "Show only rows with missing fields, bad values, or formatting issues.",
+                key="error_filter", label="Error Filter", icon="🚨",
+                timing="flexible", description="Show only rows with missing fields, bad values, or formatting issues.",
             ),
             PipelineStep(
-                key         = "cluster_by_similarity",
-                label       = "Cluster by Similarity",
-                icon        = "🧩",
-                timing      = "flexible",
-                repeatable  = True,
-                description = "Group similar items for bulk resolution.",
-                sub_options = [
+                key="cluster_by_similarity", label="Cluster by Similarity", icon="🧩",
+                timing="flexible", repeatable=True,
+                description="Group similar items for bulk resolution.",
+                sub_options=[
                     {"key": "description", "label": "Description",  "default": True},
                     {"key": "pack_size",   "label": "Pack Size",    "default": True},
                     {"key": "vendor",      "label": "Vendor",       "default": False},
@@ -278,152 +313,61 @@ class ModeRegistry:
                 ],
             ),
             PipelineStep(
-                key         = "panel_build",
-                label       = "Dynamic Panel Build",
-                icon        = "📐",
-                timing      = "flexible",
-                repeatable  = False,
-                description = "Build issue-specific panels (missing pack type, GL, vendor, etc.).",
+                key="panel_build", label="Dynamic Panel Build", icon="📐",
+                timing="flexible", description="Build issue-specific panels.",
             ),
             PipelineStep(
-                key         = "fix_inline",
-                label       = "Fix Errors Inline",
-                icon        = "✏️",
-                timing      = "flexible",
-                repeatable  = True,
-                description = "Let the user correct flagged rows directly in the review table.",
+                key="fix_inline", label="Fix Errors Inline", icon="✏️",
+                timing="flexible", repeatable=True,
+                description="Let the user correct flagged rows directly in the review table.",
             ),
             PipelineStep(
-                key         = "ai_smart_chooser",
-                label       = "AI Smart Chooser",
-                icon        = "🤖",
-                timing      = "flexible",
-                repeatable  = False,
-                description = "AI-assisted resolution of ambiguous items, pack types, and GL codes.",
-            ),
-
-            # ── Fixed steps (checkbox only, natural pipeline position) ────────
-
-            PipelineStep(
-                key         = "manual_verification",
-                label       = "Manual Verification of Flagged Items",
-                icon        = "👁️",
-                timing      = "fixed",
-                repeatable  = False,
-                description = "Pause after analysis — user must review and approve flagged records.",
+                key="ai_smart_chooser", label="AI Smart Chooser", icon="🤖",
+                timing="flexible", description="AI-assisted resolution of ambiguous items.",
             ),
             PipelineStep(
-                key         = "require_panel_complete",
-                label       = "Require Panel Completion",
-                icon        = "✅",
-                timing      = "fixed",
-                repeatable  = False,
-                description = "User must resolve all dynamic panels before the import can proceed.",
+                key="manual_verification", label="Manual Verification of Flagged Items", icon="👁️",
+                timing="fixed", description="Pause after analysis — user must review flagged records.",
             ),
             PipelineStep(
-                key         = "revalidate_loop",
-                label       = "Re-Validate After Inline Fixes",
-                icon        = "🔄",
-                timing      = "fixed",
-                repeatable  = False,
-                description = "After inline edits, re-run validation. Loop until clean.",
+                key="require_panel_complete", label="Require Panel Completion", icon="✅",
+                timing="fixed", description="User must resolve all dynamic panels before proceeding.",
+            ),
+            PipelineStep(
+                key="revalidate_loop", label="Re-Validate After Inline Fixes", icon="🔄",
+                timing="fixed", description="After inline edits, re-run validation. Loop until clean.",
             ),
         ]
         for s in steps:
             self.steps[s.key] = s
 
-    # ── end of pipeline steps ─────────────────────────────────────────────────
-
-
-    # ──────────────────────────────────────────────────────────────────────────
-    #  NAMED MODES
-    # ──────────────────────────────────────────────────────────────────────────
-
     def _build_modes(self):
         modes = [
-            ImportMode(
-                key             = "validation",
-                label           = "Validation Mode",
-                icon            = "🌐",
-                description     = "Load → analyze → review all records → approve → write.",
-                pipeline_steps  = [
-                    "duplicate_detection",
-                    "manual_verification",
-                    "require_panel_complete",
-                ],
-            ),
-            ImportMode(
-                key             = "selection",
-                label           = "Selection Mode",
-                icon            = "🧭",
-                description     = "Choose exactly which rows and fields to import.",
-                pipeline_steps  = [
-                    "duplicate_detection",
-                    "manual_verification",
-                ],
-            ),
-            ImportMode(
-                key             = "data_driven",
-                label           = "Data-Driven Mode",
-                icon            = "📊",
-                description     = "The data decides what panels the user sees.",
-                pipeline_steps  = [
-                    "panel_build",
-                    "require_panel_complete",
-                ],
-            ),
-            ImportMode(
-                key             = "cluster",
-                label           = "Cluster-Driven Mode",
-                icon            = "🧩",
-                description     = "Group similar items → resolve in bulk.",
-                pipeline_steps  = [
-                    "duplicate_detection",
-                    "cluster_by_similarity",
-                    "manual_verification",
-                ],
-            ),
-            ImportMode(
-                key             = "error_driven",
-                label           = "Error-Driven Mode",
-                icon            = "🚨",
-                description     = "Show only what's broken. Fix inline. Re-validate.",
-                pipeline_steps  = [
-                    "error_filter",
-                    "fix_inline",
-                    "revalidate_loop",
-                ],
-            ),
+            ImportMode(key="validation",  label="Validation Mode",   icon="🌐",
+                       description="Load → analyze → review → approve → write.",
+                       pipeline_steps=["duplicate_detection","manual_verification","require_panel_complete"]),
+            ImportMode(key="selection",   label="Selection Mode",    icon="🧭",
+                       description="Choose exactly which rows and fields to import.",
+                       pipeline_steps=["duplicate_detection","manual_verification"]),
+            ImportMode(key="data_driven", label="Data-Driven Mode",  icon="📊",
+                       description="The data decides what panels the user sees.",
+                       pipeline_steps=["panel_build","require_panel_complete"]),
+            ImportMode(key="cluster",     label="Cluster-Driven Mode",icon="🧩",
+                       description="Group similar items → resolve in bulk.",
+                       pipeline_steps=["duplicate_detection","cluster_by_similarity","manual_verification"]),
+            ImportMode(key="error_driven",label="Error-Driven Mode", icon="🚨",
+                       description="Show only what's broken. Fix inline. Re-validate.",
+                       pipeline_steps=["error_filter","fix_inline","revalidate_loop"]),
         ]
         for m in modes:
             self.modes[m.key] = m
 
-    # ── end of named modes ────────────────────────────────────────────────────
-
-
-    # ──────────────────────────────────────────────────────────────────────────
-    #  ACCESSORS
-    # ──────────────────────────────────────────────────────────────────────────
-
-    def mode_list(self) -> List[ImportMode]:
-        """All modes in display order."""
-        return list(self.modes.values())
-
-    def step_list(self) -> List[PipelineStep]:
-        """All pipeline steps — flexible first, then fixed."""
-        return (
-            [s for s in self.steps.values() if s.timing == "flexible"] +
-            [s for s in self.steps.values() if s.timing == "fixed"]
-        )
-
-    def flexible_steps(self) -> List[PipelineStep]:
-        return [s for s in self.steps.values() if s.timing == "flexible"]
-
-    def fixed_steps(self) -> List[PipelineStep]:
-        return [s for s in self.steps.values() if s.timing == "fixed"]
+    def mode_list(self)     -> List[ImportMode]:   return list(self.modes.values())
+    def step_list(self)     -> List[PipelineStep]: return self.flexible_steps() + self.fixed_steps()
+    def flexible_steps(self)-> List[PipelineStep]: return [s for s in self.steps.values() if s.timing=="flexible"]
+    def fixed_steps(self)   -> List[PipelineStep]: return [s for s in self.steps.values() if s.timing=="fixed"]
 
     def steps_for_mode(self, mode_key: str) -> List[PipelineStep]:
-        """Return the PipelineStep objects associated with a named mode."""
         mode = self.modes.get(mode_key)
         if not mode:
             return []
@@ -434,33 +378,24 @@ class ModeRegistry:
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  IMPORT MODE SELECTOR CONFIG
-#  Carries the user's current selector preferences for the UI renderer.
-#  Populated from session_state["import_mode"] at render time.
 # ──────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class ImportModeSelectorConfig:
-    tier:    str  = "single"      # "single" | "combined" | "managed"
-    display: str  = "sidebar"     # "sidebar" | "popup" | "inline"
-    kiss:    bool = False         # True = hide managed-mode complexity, show Tier 1
+    tier:    str  = "single"
+    display: str  = "sidebar"
+    kiss:    bool = False
 
     @classmethod
     def from_session(cls, state: Dict) -> "ImportModeSelectorConfig":
-        """Build from the import_mode section of session state."""
         im = state.get("import_mode", {})
-        return cls(
-            tier    = im.get("tier",    "single"),
-            display = im.get("display", "sidebar"),
-            kiss    = False,
-        )
+        return cls(tier=im.get("tier","single"), display=im.get("display","sidebar"), kiss=False)
 
 # ── end of import mode selector config ───────────────────────────────────────
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  DATABASE MANAGEMENT CONFIG
-#  Carries the set of operations available in the DB management panel.
-#  Each entry: key, label, icon, requires_confirm, destructive
 # ──────────────────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -474,53 +409,27 @@ class DbOperation:
 
 
 DB_OPERATIONS: List[DbOperation] = [
-    DbOperation("backup",         "Backup Database",
-                icon="💾", requires_confirm=False, destructive=False,
-                description="Create a named snapshot of the current database state."),
-    DbOperation("restore",        "Restore from Backup",
-                icon="⏪", requires_confirm=True,  destructive=True,
-                description="Replace current data with a previous backup. Cannot be undone."),
-    DbOperation("duplicate",      "Duplicate Database",
-                icon="📋", requires_confirm=False, destructive=False,
-                description="Clone the current database to a new cost center."),
-    DbOperation("create_new",     "Create New Database",
-                icon="➕", requires_confirm=False, destructive=False,
-                description="Create a fresh empty database for a new cost center."),
-    DbOperation("rename",         "Rename / Relabel",
-                icon="✏️", requires_confirm=False, destructive=False,
-                description="Change the display name or label of the active database."),
-    DbOperation("assign_cc",      "Assign Cost Center(s)",
-                icon="🏷️", requires_confirm=False, destructive=False,
-                description="Link this database to one or more cost center keys."),
-    DbOperation("set_thresholds", "Set Variance Thresholds",
-                icon="🎚️", requires_confirm=False, destructive=False,
-                description="Configure flag_each and flag_value thresholds per cost center."),
-    DbOperation("clear_qty",      "Clear All Quantities",
-                icon="🔢", requires_confirm=True,  destructive=True,
-                description="Reset all quantity_on_hand values to 0. Item records are preserved."),
-    DbOperation("clear_all",      "Clear All Items",
-                icon="🗑️", requires_confirm=True,  destructive=True,
-                description="Remove all item records. GL codes and cost centers are preserved."),
-    DbOperation("full_reset",     "Full Reset",
-                icon="☢️", requires_confirm=True,  destructive=True,
-                description="Wipe the entire database. Requires typing the cost center name to confirm."),
+    DbOperation("backup",         "Backup Database",      icon="💾"),
+    DbOperation("restore",        "Restore from Backup",  icon="⏪", requires_confirm=True,  destructive=True),
+    DbOperation("duplicate",      "Duplicate Database",   icon="📋"),
+    DbOperation("create_new",     "Create New Database",  icon="➕"),
+    DbOperation("rename",         "Rename / Relabel",     icon="✏️"),
+    DbOperation("assign_cc",      "Assign Cost Center(s)",icon="🏷️"),
+    DbOperation("set_thresholds", "Set Variance Thresholds",icon="🎚️"),
+    DbOperation("clear_qty",      "Clear All Quantities", icon="🔢", requires_confirm=True,  destructive=True),
+    DbOperation("clear_all",      "Clear All Items",      icon="🗑️", requires_confirm=True,  destructive=True),
+    DbOperation("full_reset",     "Full Reset",           icon="☢️", requires_confirm=True,  destructive=True),
 ]
 
 # ── end of database management config ────────────────────────────────────────
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  DEFAULT REGISTRY  —  module-level singleton
+#  DEFAULT REGISTRY
 # ──────────────────────────────────────────────────────────────────────────────
 
 def build_default_registry() -> FeatureRegistry:
-    """
-    Returns a FeatureRegistry with all known features registered.
-    Enabled = implemented + tested.  Disabled = on the roadmap.
-    """
     reg = FeatureRegistry()
-
-    # ── Live features ─────────────────────────────────────────────────────────
     reg.add("inventory",            "Inventory Items View",          True)
     reg.add("history",              "Change History",                True)
     reg.add("gl_codes",             "GL Code Manager",               True)
@@ -532,21 +441,18 @@ def build_default_registry() -> FeatureRegistry:
     reg.add("dashboard",            "Dashboard",                     True)
     reg.add("import_mode_selector", "Import Mode Selector",          True)
     reg.add("db_management",        "Database Management",           True)
-
-    # ── Roadmap features — visible but greyed out ─────────────────────────────
     reg.add("pca_engine",           "PCA Creator & Build Sandbox",   False)
     reg.add("transfer_engine",      "Transfer Sheet Generator",      False)
     reg.add("pca_waste_calc",       "Advanced Waste Tracking",       False)
     reg.add("mode_historical",      "Chronological Data Injection",  False)
     reg.add("pca_recursive",        "In-House Product Promotion",    False)
-
     return reg
 
 # ── end of default registry ───────────────────────────────────────────────────
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  MODULE-LEVEL SINGLETONS  —  import these directly where needed
+#  MODULE-LEVEL SINGLETONS
 # ──────────────────────────────────────────────────────────────────────────────
 
 DEFAULT_REGISTRY  = build_default_registry()
