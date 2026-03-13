@@ -27,7 +27,7 @@ import onedrive_connector as od
 #  VERSION
 # ──────────────────────────────────────────────────────────────────────────────
 
-__version__ = "3.0.2"
+__version__ = "3.1.0"
 
 # ── end of version ────────────────────────────────────────────────────────────
 
@@ -60,20 +60,22 @@ from ui_skeleton import (
     build_default_registry, MenuBar, SidebarConfig,
     DB_OPERATIONS, DEFAULT_MODE_REG
 )
+from auth import (
+    require_auth, get_current_user, get_changed_by, get_role,
+    is_admin, is_editor, why_prompt, sign_out, render_user_badge,
+    render_user_management,
+)
 
 # ── end of local module imports ───────────────────────────────────────────────
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  CACHED RESOURCE HELPERS
-#  The version string is hashed from database.py's mtime so the cache busts
-#  automatically whenever database.py is updated in the repo.
 # ──────────────────────────────────────────────────────────────────────────────
 
 import hashlib as _hashlib, pathlib as _pathlib
 
 def _db_version() -> str:
-    """Return a short hash of database.py so the cache key changes on update."""
     try:
         p = _pathlib.Path(__file__).parent / "database.py"
         return _hashlib.md5(p.read_bytes()).hexdigest()[:8]
@@ -85,7 +87,6 @@ def get_db(_ver: str = ""):
     return InventoryDatabase()
 
 def _get_db():
-    """Always passes the current database.py hash so stale instances are evicted."""
     return get_db(_ver=_db_version())
 
 def get_importer():
@@ -112,7 +113,7 @@ def _init_import_state():
     if "import_results"     not in st.session_state:
         st.session_state.import_results     = {}
     if "import_selections"  not in st.session_state:
-        st.session_state.import_selections  = {}  # {ck_string: bool}
+        st.session_state.import_selections  = {}
 
 # ── end of session state initializers ────────────────────────────────────────
 
@@ -223,6 +224,10 @@ def page_inventory():
     st.caption(f"{len(df)} items")
     st.dataframe(df[display_cols], use_container_width=True, hide_index=True)
 
+    if not is_editor():
+        st.info("🔒 View-only access. Contact an admin to edit items.")
+        return
+
     st.markdown("---")
     st.subheader("✏️ Edit Item")
 
@@ -263,6 +268,12 @@ def _edit_item_form(db, item: dict):
         lock_yield = oc2.checkbox("Lock Yield",       value=bool(item.get("override_yield")))
         lock_conv  = oc3.checkbox("Lock Conv. Ratio", value=bool(item.get("override_conv_ratio")))
 
+        reason = st.text_input(
+            "Reason for change",
+            placeholder="Describe why you are editing this item (optional)",
+            key="edit_item_reason",
+        )
+
         submitted = st.form_submit_button("💾 Save Changes")
 
     if submitted:
@@ -296,8 +307,12 @@ def _edit_item_form(db, item: dict):
         elif not lock_conv and item.get("override_conv_ratio"):
             updates["override_conv_ratio"] = None
 
-        db._apply_update(item["key"], updates,
-                         change_source="manual_edit", changed_by="user")
+        db._apply_update(
+            item["key"], updates,
+            change_source="manual_edit",
+            changed_by=get_changed_by(),
+            change_reason=reason.strip() or None,
+        )
         st.success("✅ Saved!")
         st.rerun()
 
@@ -309,31 +324,23 @@ def _edit_item_form(db, item: dict):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _ck(filename: str, item_key: str) -> str:
-    """Key string for import_selections dict entry."""
     return f"{filename}||{item_key}"
-
 
 def _all_items_for_file(d: dict) -> list:
     if not d.get("analysis"):
         return []
     return d["analysis"]["new_items"] + d["analysis"]["updates"]
 
-
 def _sel() -> dict:
-    """Shortcut to the single source-of-truth selections dict."""
     return st.session_state.setdefault("import_selections", {})
-
 
 def _get_sel(filename: str, item_key: str) -> bool:
     return _sel().get(_ck(filename, item_key), True)
 
-
 def _set_sel(filename: str, item_key: str, value: bool):
     _sel()[_ck(filename, item_key)] = value
 
-
 def _file_selection_state(d: dict):
-    """True = all checked, False = none checked, None = indeterminate."""
     items = _all_items_for_file(d)
     if not items:
         return False
@@ -344,9 +351,7 @@ def _file_selection_state(d: dict):
         return False
     return None
 
-
 def _global_selection_state():
-    """True = all files fully checked, False = nothing, None = mixed."""
     states = [
         _file_selection_state(d)
         for d in st.session_state.import_data
@@ -360,25 +365,20 @@ def _global_selection_state():
         return False
     return None
 
-
 def _set_file_items(d: dict, value: bool):
     for item in _all_items_for_file(d):
         _set_sel(d["filename"], item["key"], value)
-
 
 def _set_all_items(value: bool):
     for d in st.session_state.import_data:
         _set_file_items(d, value)
 
-
 def _toggle_icon(state) -> str:
-    """☑ = all selected  ▣ = some selected  ☐ = none selected."""
     if state is True:
         return "☑"
     if state is False:
         return "☐"
     return "▣"
-
 
 def _count_selected() -> int:
     return sum(1 for v in _sel().values() if v)
@@ -394,7 +394,7 @@ def _analyze_uploaded_files(uploaded_files, importer):
     st.session_state.import_data       = []
     st.session_state.import_committed  = False
     st.session_state.import_results    = {}
-    st.session_state.import_selections = {}   # full reset on new file list
+    st.session_state.import_selections = {}
 
     for f in uploaded_files:
         content        = f.read()
@@ -435,7 +435,6 @@ def _analyze_uploaded_files(uploaded_files, importer):
         }
         st.session_state.import_data.append(entry)
 
-        # Pre-populate all items as selected
         if analysis:
             for item in _all_items_for_file(entry):
                 _set_sel(f.name, item["key"], True)
@@ -449,7 +448,8 @@ def _execute_selected_imports(importer):
         "errors":          [],
         "source_files":    [],
     }
-    doc_date = datetime.now().strftime("%Y-%m-%d")
+    doc_date   = datetime.now().strftime("%Y-%m-%d")
+    changed_by = get_changed_by()
 
     for d in st.session_state.import_data:
         analysis = d["analysis"]
@@ -476,7 +476,7 @@ def _execute_selected_imports(importer):
         }
         r = importer.execute_import(
             filtered,
-            changed_by="web_import",
+            changed_by=changed_by,
             source_document=filename,
             doc_date=doc_date,
         )
@@ -502,7 +502,7 @@ def _execute_selected_imports(importer):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  IMPORT — REVIEW UI  (select / deselect items before committing)
+#  IMPORT — REVIEW UI
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _render_select_all_toggle(state, button_key: str, label_suffix: str = "") -> bool:
@@ -522,7 +522,6 @@ def _render_import_review(importer):
     )
     total_warn  = sum(len(d["parse_warnings"]) for d in data)
 
-    # Placeholder — filled in AFTER all checkboxes write their values back to sel
     metrics_ph = st.empty()
 
     if total_warn:
@@ -530,8 +529,6 @@ def _render_import_review(importer):
 
     st.markdown("---")
 
-    # ── Global Select All + top Commit ──────────────────────────────
-    # Note: global_state and counts computed fresh each render from sel dict
     gh1, gh2 = st.columns([3, 3])
     with gh1:
         if _render_select_all_toggle(
@@ -549,7 +546,6 @@ def _render_import_review(importer):
 
     st.markdown("---")
 
-    # ── Per-file sections ────────────────────────────────────────────
     for d in data:
         filename   = d["filename"]
         analysis   = d["analysis"]
@@ -583,7 +579,6 @@ def _render_import_review(importer):
         else:
             fh4.success("✅ No parsing issues")
 
-        # File-level Select All toggle
         safe_key   = re.sub(r'[^a-zA-Z0-9]', '_', filename)
         file_state = _file_selection_state(d)
         file_sel   = sum(1 for i in file_items if _get_sel(filename, i["key"]))
@@ -597,10 +592,6 @@ def _render_import_review(importer):
                 _set_file_items(d, file_state is not True)
                 st.rerun()
 
-        # Individual checkboxes — NO key=.
-        # We own all state in sel dict. Checkbox return value is written
-        # back to sel every render; metrics placeholder is filled after
-        # all writes so counts are always current.
         with st.expander(
             f"Items — {file_sel} of {len(file_items)} selected",
             expanded=True,
@@ -621,13 +612,10 @@ def _render_import_review(importer):
                 label       = f"{tag} **{item['description']}** `{item['key'].split('||')[1]}`{change_note}"
                 current_val = _get_sel(filename, item["key"])
                 new_val     = st.checkbox(label, value=current_val)
-                # Always write back — this is the only place sel is updated
-                # for individual items (buttons do bulk writes + rerun)
                 _set_sel(filename, item["key"], new_val)
 
         st.markdown("---")
 
-    # ── Fill metrics placeholder now that all checkbox writes are done ──
     selected_final = _count_selected()
     with metrics_ph.container():
         mc1, mc2, mc3, mc4, mc5 = st.columns(5)
@@ -637,7 +625,6 @@ def _render_import_review(importer):
         mc4.metric("⏭️ Skipped",   total_skip)
         mc5.metric("✅ Selected",  selected_final)
 
-    # ── Bottom commit bar ────────────────────────────────────────────
     bc1, bc2 = st.columns([3, 3])
     with bc1:
         if _render_select_all_toggle(
@@ -669,7 +656,6 @@ def _render_import_results():
     rc2.metric("New Items Added",  r.get("new_items_added", 0))
     rc3.metric("Items Updated",    r.get("items_updated",   0))
 
-    # Per-file breakdown
     source_files = r.get("source_files", [])
     if source_files:
         st.markdown("**Files included in this import:**")
@@ -708,13 +694,15 @@ def _render_import_results():
 
 def page_import():
     st.title("📥 Import Files")
+    if not is_editor():
+        st.warning("🔒 Import requires editor access or higher.")
+        return
     _init_import_state()
     importer = get_importer()
 
     tab1, tab2 = st.tabs(["📤 Upload from Computer", "☁️ Import from OneDrive"])
 
     with tab1:
-        # Show the uploader only when not yet committed
         if not st.session_state.import_committed:
             st.subheader("Upload Invoice or Inventory CSV / XLSX")
             uploaded = st.file_uploader(
@@ -727,7 +715,6 @@ def page_import():
             uploaded = None
 
         if uploaded:
-            # Compact 3-column file grid — no pagination
             st.markdown("**Uploaded files:**")
             grid_cols = st.columns(3)
             for i, f in enumerate(uploaded):
@@ -754,7 +741,6 @@ def page_import():
             _render_import_results()
 
         else:
-            # Files were cleared — reset state
             if st.session_state.import_data:
                 st.session_state.import_data      = []
                 st.session_state.import_committed = False
@@ -783,7 +769,7 @@ def page_import():
                                 tmp.write(content)
                                 tmp_path = tmp.name
                             analysis, results = importer.import_file(
-                                tmp_path, changed_by="onedrive_import"
+                                tmp_path, changed_by=get_changed_by()
                             )
                             os.unlink(tmp_path)
                             st.success(
@@ -870,7 +856,7 @@ def page_history():
             cols = [c for c in [
                 "change_date", "change_type", "field_changed",
                 "old_value", "new_value", "change_source",
-                "changed_by", "source_document"
+                "changed_by", "change_reason", "source_document"
             ] if c in df.columns]
             st.dataframe(df[cols], use_container_width=True, hide_index=True)
         else:
@@ -884,15 +870,8 @@ def page_history():
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _sanitize_for_excel(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Prepare a DataFrame for openpyxl export:
-    • Strip timezone from TIMESTAMPTZ columns (openpyxl rejects tz-aware datetimes)
-    • Convert dict/list/JSONB columns to JSON strings
-    • Convert any remaining non-serializable objects to str
-    """
     df = df.copy()
     for col in df.columns:
-        # Timezone-aware datetimes → naive UTC
         if pd.api.types.is_datetime64_any_dtype(df[col]):
             try:
                 df[col] = df[col].dt.tz_localize(None)
@@ -902,7 +881,6 @@ def _sanitize_for_excel(df: pd.DataFrame) -> pd.DataFrame:
                 except Exception:
                     df[col] = df[col].astype(str)
         else:
-            # Check for object columns containing dicts, lists, or mixed types
             sample = df[col].dropna()
             if not sample.empty and isinstance(sample.iloc[0], (dict, list)):
                 import json as _json
@@ -955,14 +933,14 @@ def page_export():
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  PAGE — COUNT IMPORT  (myOrders CSV / XLSX / PDF count exports)
+#  PAGE — COUNT IMPORT
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _init_count_state():
     defaults = {
-        "count_records":    None,   # List[CountRecord] after parse
-        "count_variance":   None,   # List[VarianceRecord] after diff
-        "count_fmt":        None,   # format_info dict
+        "count_records":    None,
+        "count_variance":   None,
+        "count_fmt":        None,
         "count_committed":  False,
         "count_results":    None,
         "count_file_name":  "",
@@ -974,8 +952,7 @@ def _init_count_state():
 
 
 def page_count_overrides():
-    """Override & Rule Manager — MOG fix rules and count correction overrides."""
-    db = get_db()
+    db = _get_db()
     st.title("⚙️ Override & Rule Manager")
     st.caption(
         "Manage count correction rules for items whose pack ratios cannot be changed "
@@ -983,9 +960,6 @@ def page_count_overrides():
         "every count import."
     )
 
-    # ── Load & persist user preference defaults ───────────────────────────────
-    # These are the sticky defaults for the Add/Edit form — user changes are
-    # saved back to DB so they persist across sessions.
     if "ovr_default_scope" not in st.session_state:
         st.session_state["ovr_default_scope"] = db.get_override_setting(
             "default_scope", "global"
@@ -995,14 +969,10 @@ def page_count_overrides():
             "default_case_behavior", "ignore"
         )
 
-    # ── Tabs ──────────────────────────────────────────────────────────────────
     tab_rules, tab_add, tab_prefs = st.tabs(
         ["📋 Active Rules", "➕ Add / Edit Rule", "🔧 Default Preferences"]
     )
 
-    # ────────────────────────────────────────────────────────────────────────
-    # TAB 1 — Active Rules table
-    # ────────────────────────────────────────────────────────────────────────
     with tab_rules:
         rules = db.get_all_count_overrides()
         if not rules:
@@ -1042,51 +1012,28 @@ def page_count_overrides():
                         st.success(f"Rule deleted for {desc}")
                         st.rerun()
 
-    # ────────────────────────────────────────────────────────────────────────
-    # TAB 2 — Add / Edit Rule
-    # ────────────────────────────────────────────────────────────────────────
     with tab_add:
         st.markdown("#### Add or update a count correction rule")
-        st.caption(
-            "Tip: for MOG items with inverted pack ratios (e.g. 1LB Tray — the system "
-            "counts individual trays but expects cases of 1000), set **divisor** to 1000 "
-            "and **case behavior** to *Ignore case qty*."
-        )
-
-        # Pre-populate scope/behavior from saved defaults
         default_scope    = st.session_state["ovr_default_scope"]
         default_behavior = st.session_state["ovr_default_case_behavior"]
 
         with st.form("add_override_form", clear_on_submit=True):
             st.markdown("**Item key**")
-            st.caption("Format: `ITEM NAME||PACK_TYPE` (uppercase, double-pipe). "
-                       "Find it on the Items page.")
             item_key = st.text_input(
                 "Item key", placeholder="1LB TRAY||1/1000", label_visibility="collapsed"
             )
-
             divisor = st.number_input(
                 "Divisor (each qty ÷ divisor = corrected each qty)",
                 min_value=0.0001, value=1000.0, step=1.0, format="%.4f"
             )
-
             scope_opts = ["global", "per cost center"]
             scope = st.selectbox(
-                "Scope",
-                scope_opts,
+                "Scope", scope_opts,
                 index=scope_opts.index(default_scope) if default_scope in scope_opts else 0,
-                help="Global = applies to this item at every location. "
-                     "Per cost center = only applies at the specified cost center.",
             )
-
             cost_center = "*"
             if scope == "per cost center":
-                cost_center = st.text_input(
-                    "Cost center name",
-                    placeholder="e.g. Ferttita",
-                    help="Must match the cost center prefix from the export file.",
-                )
-
+                cost_center = st.text_input("Cost center name", placeholder="e.g. Ferttita")
             behavior_opts  = ["ignore", "add"]
             behavior_labels = [
                 "Ignore case qty — only use each ÷ divisor",
@@ -1094,19 +1041,11 @@ def page_count_overrides():
             ]
             behavior_idx = behavior_opts.index(default_behavior) if default_behavior in behavior_opts else 0
             behavior = st.selectbox(
-                "Case quantity behavior",
-                behavior_opts,
-                index=behavior_idx,
+                "Case quantity behavior", behavior_opts, index=behavior_idx,
                 format_func=lambda x: behavior_labels[behavior_opts.index(x)],
             )
-
-            notes = st.text_input("Notes (optional)", placeholder="e.g. MOG item — tray count inverted")
-
-            save_as_default = st.checkbox(
-                "Save scope & case behavior as my new defaults",
-                value=False,
-            )
-
+            notes          = st.text_input("Notes (optional)")
+            save_as_default = st.checkbox("Save scope & case behavior as my new defaults", value=False)
             submitted = st.form_submit_button("💾 Save Rule", type="primary")
 
         if submitted:
@@ -1115,12 +1054,12 @@ def page_count_overrides():
             else:
                 cc = cost_center.strip() if scope == "per cost center" else "*"
                 ok = db.upsert_count_override(
-                    item_key     = item_key.strip().upper(),
-                    divisor      = float(divisor),
-                    case_behavior= behavior,
-                    cost_center  = cc,
-                    notes        = notes.strip(),
-                    created_by   = "user",
+                    item_key=item_key.strip().upper(),
+                    divisor=float(divisor),
+                    case_behavior=behavior,
+                    cost_center=cc,
+                    notes=notes.strip(),
+                    created_by=get_changed_by(),
                 )
                 if ok:
                     st.success(f"✅ Rule saved for `{item_key.strip().upper()}`")
@@ -1133,39 +1072,27 @@ def page_count_overrides():
                 else:
                     st.error("Failed to save rule. Check the item key and try again.")
 
-    # ────────────────────────────────────────────────────────────────────────
-    # TAB 3 — Default Preferences
-    # ────────────────────────────────────────────────────────────────────────
     with tab_prefs:
         st.markdown("#### Default preferences for new rules")
-        st.caption(
-            "These defaults pre-fill the Add / Edit Rule form. They can also be "
-            "updated inline when saving any rule."
-        )
-
         scope_opts     = ["global", "per cost center"]
         behavior_opts  = ["ignore", "add"]
         behavior_labels = [
             "Ignore case qty — only use each ÷ divisor",
             "Add case qty — (each ÷ divisor) + (case × conv)",
         ]
-
         pref_scope = st.selectbox(
-            "Default scope",
-            scope_opts,
+            "Default scope", scope_opts,
             index=scope_opts.index(st.session_state["ovr_default_scope"])
                   if st.session_state["ovr_default_scope"] in scope_opts else 0,
             key="pref_scope_select",
         )
         pref_behavior = st.selectbox(
-            "Default case behavior",
-            behavior_opts,
+            "Default case behavior", behavior_opts,
             index=behavior_opts.index(st.session_state["ovr_default_case_behavior"])
                   if st.session_state["ovr_default_case_behavior"] in behavior_opts else 0,
             format_func=lambda x: behavior_labels[behavior_opts.index(x)],
             key="pref_behavior_select",
         )
-
         if st.button("💾 Save Preferences", type="primary"):
             db.set_override_setting("default_scope",         pref_scope)
             db.set_override_setting("default_case_behavior", pref_behavior)
@@ -1179,15 +1106,16 @@ def page_count_import():
 
     st.title("📋 Count Import")
     st.caption("Import on-hand counts from myOrders CSV, XLSX, or PDF exports.")
+    if not is_editor():
+        st.warning("🔒 Count import requires editor access or higher.")
+        return
     _init_count_state()
     ci = get_count_importer()
 
-    # ── RESULTS SCREEN (after commit) ────────────────────────────────────────
     if st.session_state.count_committed and st.session_state.count_results:
         _render_count_results()
         return
 
-    # ── STEP 1 — UPLOAD ──────────────────────────────────────────────────────
     st.subheader("Step 1 — Upload Count File")
     uploaded = st.file_uploader(
         "Drop myOrders count export here (CSV, XLSX, or PDF)",
@@ -1196,11 +1124,9 @@ def page_count_import():
     )
 
     if not uploaded:
-        # Show prior import history
         _render_count_history()
         return
 
-    # Re-parse only when a new file is uploaded
     if uploaded.name != st.session_state.count_file_name:
         content = uploaded.read()
         st.session_state.count_file_bytes = content
@@ -1227,10 +1153,9 @@ def page_count_import():
     fmt     = st.session_state.count_fmt or {}
 
     if not records:
-        st.warning("No records found in this file. Check that it is a valid count export.")
+        st.warning("No records found in this file.")
         return
 
-    # ── STEP 2 — FILE SUMMARY + OPTIONS ──────────────────────────────────────
     st.markdown("---")
     st.subheader("Step 2 — Confirm Details")
 
@@ -1248,15 +1173,10 @@ def page_count_import():
 
     col1, col2, col3 = st.columns(3)
     with col1:
-        count_date = st.date_input(
-            "Count Date",
-            value=datetime.now().date(),
-        )
+        count_date = st.date_input("Count Date", value=datetime.now().date())
     with col2:
         count_type = st.radio(
-            "Count Type",
-            ["complete", "partial"],
-            horizontal=True,
+            "Count Type", ["complete", "partial"], horizontal=True,
             help="Complete: overwrites all qty. Partial: updates listed items only.",
         )
     with col3:
@@ -1270,16 +1190,13 @@ def page_count_import():
     with col2:
         flag_value = st.number_input("Flag threshold — value ($)", value=50.0, min_value=0.0, format="%.2f")
 
-    # Filter records if location scope selected
     work_records = records
     if location_filter:
         work_records = [r for r in records if r.location in location_filter]
 
-    # ── STEP 3 — VARIANCE PREVIEW ─────────────────────────────────────────────
     st.markdown("---")
     st.subheader("Step 3 — Variance Preview")
 
-    # Recalculate when options change
     calc_key = f"{uploaded.name}|{flag_each}|{flag_value}|{'|'.join(sorted(location_filter))}"
     if (st.session_state.count_variance is None or
             st.session_state.get("_calc_key") != calc_key):
@@ -1303,7 +1220,7 @@ def page_count_import():
 
     vc1, vc2, vc3, vc4 = st.columns(4)
     vc1.metric("Total Items",     len(variance))
-    vc2.metric("🚩 Flagged",      len(flagged),   delta=None)
+    vc2.metric("🚩 Flagged",      len(flagged))
     vc3.metric("❓ Not in DB",    len(not_in_db))
     vc4.metric("Net Value Δ",     f"${net_value:+,.2f}")
 
@@ -1339,25 +1256,6 @@ def page_count_import():
         else:
             st.success("No items exceed variance thresholds.")
 
-    # ──────────────────────────────────────────────────────────────────────────────
-#  PATCH — Diagnostic CSV Export for Count Import Variance
-#
-#  In app.py, find this line (around line 1135):
-#
-#      with tab_all:
-#          loc_opts = ["All"] + sorted(set(v.record.location for v in variance))
-#          sel_loc  = st.selectbox("Filter by location", loc_opts, key="var_loc_filter")
-#          show_rows = variance if sel_loc == "All" else [
-#              v for v in variance if v.record.location == sel_loc
-#          ]
-#          st.dataframe(_variance_df(show_rows), use_container_width=True, hide_index=True)
-#
-#  REPLACE that entire `with tab_all:` block with the version below.
-#  The export button also appears outside the tabs so it's always visible.
-# ──────────────────────────────────────────────────────────────────────────────
-
-# ── REPLACE the existing `with tab_all:` block with this ─────────────────────
-
     with tab_all:
         loc_opts  = ["All"] + sorted(set(v.record.location for v in variance))
         sel_loc   = st.selectbox("Filter by location", loc_opts, key="var_loc_filter")
@@ -1366,16 +1264,6 @@ def page_count_import():
         ]
         st.dataframe(_variance_df(show_rows), use_container_width=True, hide_index=True)
 
-    # ── Diagnostic export — always visible, outside the tabs ─────────────────
-    #
-    #  Includes every field needed to trace the $33K vs $102K discrepancy:
-    #    count_qty_case / count_qty_each — raw counted quantities
-    #    price_case / price_each         — per-unit prices from export
-    #    total_price                     — authoritative pre-computed value
-    #    computed_value                  — what new_qty × price_each would give
-    #    variance_value                  — what was actually recorded
-    #    delta                           — total_price minus computed_value
-    #
     st.markdown("---")
     col_exp, col_sum = st.columns([2, 2])
 
@@ -1386,15 +1274,11 @@ def page_count_import():
                          else v.db_price_each)
             for v in variance
         )
-        sum_variance_value = sum(v.variance_value for v in variance)
         st.caption("**Totals — pre-export diagnostic**")
         d1, d2, d3 = st.columns(3)
-        d1.metric("SUM(total_price)",    f"${sum_total_price:,.2f}",
-                  help="Direct sum of pre-computed Total Price from export rows.")
-        d2.metric("SUM(qty × price)",    f"${sum_computed_value:,.2f}",
-                  help="Recomputed: new_qty × price_each. Should differ from above if conv_ratio is missing.")
-        d3.metric("Delta",               f"${sum_total_price - sum_computed_value:+,.2f}",
-                  help="Positive = total_price is higher. This is the gap being diagnosed.")
+        d1.metric("SUM(total_price)",    f"${sum_total_price:,.2f}")
+        d2.metric("SUM(qty × price)",    f"${sum_computed_value:,.2f}")
+        d3.metric("Delta",               f"${sum_total_price - sum_computed_value:+,.2f}")
 
     with col_exp:
         def _diagnostic_df(rows):
@@ -1409,33 +1293,27 @@ def page_count_import():
                     "description":      rec.item_description,
                     "pack_type":        rec.pack_type,
                     "item_key":         rec.item_key,
-                    # --- counts ---
                     "count_qty_case":   rec.count_qty_case,
                     "count_qty_each":   rec.count_qty_each,
                     "new_qty":          round(v.new_qty, 4),
-                    # --- prices ---
                     "price_case":       rec.price_case,
                     "price_each":       rec.price_each,
                     "db_price_each":    round(v.db_price_each, 4),
-                    # --- values ---
-                    "total_price":      rec.total_price,      # from export (authoritative)
-                    "computed_value":   computed_val,         # new_qty × price_each
+                    "total_price":      rec.total_price,
+                    "computed_value":   computed_val,
                     "delta":            round(rec.total_price - computed_val, 4),
                     "variance_value":   round(v.variance_value, 2),
-                    # --- db state ---
                     "db_qty":           round(v.db_qty, 4),
                     "in_db":            v.in_db,
                     "is_flagged":       v.is_flagged,
                     "flag_reason":      v.flag_reason,
                     "is_chargeable":    rec.is_chargeable,
-                    # --- uom ---
                     "uom_case":         rec.uom_case,
                     "uom_each":         rec.uom_each,
                 })
             return pd.DataFrame(out)
 
         diag_df = _diagnostic_df(variance)
-
         st.download_button(
             label       = "⬇️ Export Diagnostic CSV",
             data        = diag_df.to_csv(index=False).encode(),
@@ -1445,15 +1323,8 @@ def page_count_import():
             ),
             mime        = "text/csv",
             use_container_width=True,
-            help=(
-                "Full diagnostic export: raw counts, prices, total_price from export, "
-                "computed value, and delta. Use to trace the $33K vs $102K discrepancy."
-            ),
         )
 
-# ── end of patch ──────────────────────────────────────────────────────────────
-
-    # ── STEP 4 — COMMIT ───────────────────────────────────────────────────────
     st.markdown("---")
     st.subheader("Step 4 — Commit Count")
 
@@ -1463,17 +1334,11 @@ def page_count_import():
     if items_missing:
         st.info(
             f"ℹ️ **{len(items_missing)} item(s) not currently in the database.** "
-            f"Use the option below to add them automatically from the count data, "
-            f"or skip them and add manually later."
+            f"Use the option below to add them automatically from the count data."
         )
         add_missing = st.toggle(
             f"➕ Add {len(items_missing)} unmatched item(s) to the database from this count",
             value=True,
-            help=(
-                "Creates a new DB record for each unmatched item using the description, "
-                "pack type, and price from the count file. GL code, vendor, and other "
-                "details can be filled in later via the Inventory page or a vendor import."
-            ),
         )
     else:
         add_missing = False
@@ -1500,7 +1365,7 @@ def page_count_import():
             data_layout  = fmt.get("layout", ""),
             count_type   = count_type,
             count_date   = str(count_date),
-            imported_by  = "user",
+            imported_by  = get_changed_by(),
         )
         with status_bar.timed(f"Committing {items_to_write} items to database..."):
             results = ci.execute_count_import(variance, meta, add_missing=add_missing)
@@ -1533,7 +1398,6 @@ def _render_count_results():
             for e in r["errors"]:
                 st.caption(e)
 
-    # Variance detail from DB
     db = _get_db()
     detail = db.get_count_variance_detail(r["import_id"])
     if detail:
@@ -1553,8 +1417,7 @@ def _render_count_results():
         for k in ("count_records", "count_variance", "count_fmt",
                   "count_committed", "count_results",
                   "count_file_name", "count_file_bytes", "_calc_key"):
-            st.session_state[k] = None if k not in (
-                "count_committed",) else False
+            st.session_state[k] = None if k not in ("count_committed",) else False
         st.rerun()
 
 
@@ -1565,8 +1428,7 @@ def _render_count_history():
     except Exception as e:
         st.info(
             "Count import history is not available yet — the count tables may still be "
-            "initializing. Try rebooting the app from the Streamlit Cloud dashboard, "
-            "or upload a file above to trigger table creation."
+            "initializing."
         )
         st.caption(f"Detail: {e}")
         return
@@ -1586,7 +1448,6 @@ def _render_count_history():
     df["variance_value"]   = df["variance_value"].apply(lambda x: f"${float(x or 0):+,.2f}")
     st.dataframe(df, use_container_width=True, hide_index=True)
 
-    # Drill-down into a specific import
     import_ids = [i["import_id"] for i in imports]
     sel_id = st.selectbox(
         "View variance detail for import",
@@ -1617,15 +1478,15 @@ def page_settings():
     st.title("⚙️ Settings")
     reg = st.session_state["_registry"]
 
-    tab_feat, tab_sidebar, tab_prefs = st.tabs([
+    tab_feat, tab_sidebar, tab_prefs, tab_users = st.tabs([
         "🔧 Feature Toggles",
         "◀️ Sidebar",
         "👤 Preferences",
+        "👥 User Management",
     ])
 
     with tab_feat:
         st.subheader("Feature Toggles")
-        st.caption("Enabled features are live. Disabled features appear greyed out in the menu.")
         for ft in reg.all_features():
             col1, col2 = st.columns([3, 1])
             col1.write(f"**{ft.name}** — {ft.description}")
@@ -1640,11 +1501,11 @@ def page_settings():
     with tab_sidebar:
         st.subheader("Sidebar Settings")
         cfg = st.session_state["_sidebar_cfg"]
-        cfg.visible        = st.toggle("Show Sidebar",           value=cfg.visible)
-        cfg.show_nav       = st.toggle("Show nav links",         value=cfg.show_nav)
+        cfg.visible          = st.toggle("Show Sidebar",           value=cfg.visible)
+        cfg.show_nav         = st.toggle("Show nav links",         value=cfg.show_nav)
         cfg.show_cost_center = st.toggle("Show cost center badge", value=cfg.show_cost_center)
-        cfg.show_recent    = st.toggle("Show recent imports",    value=cfg.show_recent)
-        cfg.custom_label   = st.text_input("Sidebar label",      value=cfg.custom_label)
+        cfg.show_recent      = st.toggle("Show recent imports",    value=cfg.show_recent)
+        cfg.custom_label     = st.text_input("Sidebar label",      value=cfg.custom_label)
         st.session_state["_sidebar_cfg"] = cfg
         if st.button("Apply"):
             st.rerun()
@@ -1653,29 +1514,23 @@ def page_settings():
         st.subheader("Preferences")
         st.info("User preferences coming soon.")
 
+    with tab_users:
+        render_user_management(_get_db())
+
 # ── end of page — settings ────────────────────────────────────────────────────
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  PAGE — DATABASE MANAGEMENT
-#  Paste this function into app.py, then add the two lines noted at the
-#  bottom to wire it into main().
-#
-#  Operations covered:
-#    Backup · Restore · Duplicate · Create New · Rename / Relabel
-#    Assign Cost Center(s) · Set Variance Thresholds
-#    Clear Quantities · Clear All Items · Full Reset
-#
-#  Safety rules:
-#    • All destructive operations require a two-step confirm
-#    • Full Reset requires typing the cost center name to unlock
-#    • Clear operations show a row-count preview before confirming
-#    • Restore shows backup metadata before confirming
 # ──────────────────────────────────────────────────────────────────────────────
 
 def page_db_management():
     from session_state import init_session_state, reset_db_mgmt_confirm
     from ui_skeleton   import DB_OPERATIONS
+
+    if not is_admin():
+        st.warning("🔒 Database management requires admin access.")
+        return
 
     init_session_state(st.session_state)
     db = _get_db()
@@ -1683,14 +1538,12 @@ def page_db_management():
     st.title("🗄️ Database Management")
     st.caption("Backup, restore, configure, and maintain your inventory database.")
 
-    # ── Confirm-state helper ─────────────────────────────────────────────────
     def _mgmt(key, default=None):
         return st.session_state["db_mgmt"].get(key, default)
 
     def _set_mgmt(key, val):
         st.session_state["db_mgmt"][key] = val
 
-    # ── Tabs ─────────────────────────────────────────────────────────────────
     tab_backup, tab_structure, tab_thresholds, tab_danger = st.tabs([
         "💾  Backup & Restore",
         "🏗️  Structure",
@@ -1698,16 +1551,9 @@ def page_db_management():
         "⚠️  Danger Zone",
     ])
 
-    # ── end of tabs setup ─────────────────────────────────────────────────────
-
-
-    # ──────────────────────────────────────────────────────────────────────────
-    #  TAB — BACKUP & RESTORE
-    # ──────────────────────────────────────────────────────────────────────────
-
+    # ── BACKUP & RESTORE ──────────────────────────────────────────────────────
     with tab_backup:
         st.subheader("💾 Backup")
-
         col_info, col_action = st.columns([2, 1])
 
         with col_info:
@@ -1728,14 +1574,14 @@ def page_db_management():
                 try:
                     ts    = datetime.now().strftime("%Y-%m-%d %H:%M")
                     label = backup_label.strip() or f"backup {ts}"
-                    # Export full items table to JSON stored in Streamlit state
                     items = db.get_all_items(None)
                     import json
                     snapshot = {
-                        "label":     label,
-                        "ts":        ts,
+                        "label":      label,
+                        "ts":         ts,
                         "item_count": len(items),
-                        "items":     items,
+                        "items":      items,
+                        "created_by": get_changed_by(),
                     }
                     if "db_backups" not in st.session_state:
                         st.session_state["db_backups"] = []
@@ -1749,11 +1595,9 @@ def page_db_management():
 
         st.markdown("---")
         st.subheader("⬇️ Download Backup")
-
         items_all = db.get_all_items(None)
         if items_all:
             import json, io as _io
-            dl_label = backup_label.strip() if 'backup_label_input' in st.session_state else "backup"
             dl_bytes = json.dumps(items_all, indent=2, default=str).encode()
             st.download_button(
                 label    = "⬇️ Download as JSON",
@@ -1776,25 +1620,17 @@ def page_db_management():
 
         st.markdown("---")
         st.subheader("⏪ Restore from Session Backup")
-
         backups = st.session_state.get("db_backups", [])
         if not backups:
             st.info("No session backups available. Create a backup above first.")
         else:
             options = {f"{b['label']} ({b['item_count']} items — {b['ts']})": i
                        for i, b in enumerate(backups)}
-            chosen_label = st.selectbox(
-                "Select backup to restore",
-                options=list(options.keys()),
-                key="restore_select",
-            )
-            chosen_idx = options[chosen_label]
-            chosen     = backups[chosen_idx]
+            chosen_label = st.selectbox("Select backup to restore", options=list(options.keys()), key="restore_select")
+            chosen_idx   = options[chosen_label]
+            chosen       = backups[chosen_idx]
 
-            st.warning(
-                f"⚠️ Restoring **{chosen['label']}** will overwrite all "
-                f"{chosen['item_count']} items currently in the database."
-            )
+            st.warning(f"⚠️ Restoring **{chosen['label']}** will overwrite all {chosen['item_count']} items.")
 
             confirmed = _mgmt("restore_confirmed", False)
             if not confirmed:
@@ -1804,23 +1640,18 @@ def page_db_management():
             else:
                 col_go, col_cancel = st.columns(2)
                 with col_go:
-                    if st.button("⏪ Confirm Restore", type="primary",
-                                 use_container_width=True):
+                    if st.button("⏪ Confirm Restore", type="primary", use_container_width=True):
                         try:
-                            # Restore: clear items table, re-insert from snapshot
-                            with db.get_conn() as conn:  # type: ignore
+                            with db.get_conn() as conn:
                                 cur = conn.cursor()
                                 cur.execute("DELETE FROM items")
                             for item in chosen["items"]:
                                 try:
-                                    db.add_item(item, changed_by="restore")
+                                    db.add_item(item, changed_by=get_changed_by())
                                 except Exception:
-                                    db.upsert_item(item, changed_by="restore")
+                                    db.upsert_item(item, changed_by=get_changed_by())
                             reset_db_mgmt_confirm(st.session_state)
-                            st.success(
-                                f"✅ Restored {len(chosen['items'])} items "
-                                f"from **{chosen['label']}**"
-                            )
+                            st.success(f"✅ Restored {len(chosen['items'])} items from **{chosen['label']}**")
                             st.rerun()
                         except Exception as e:
                             st.error(f"Restore failed: {e}")
@@ -1829,131 +1660,78 @@ def page_db_management():
                         reset_db_mgmt_confirm(st.session_state)
                         st.rerun()
 
-    # ── end of tab — backup & restore ─────────────────────────────────────────
-
-
-    # ──────────────────────────────────────────────────────────────────────────
-    #  TAB — STRUCTURE  (rename, cost center, duplicate, create new)
-    # ──────────────────────────────────────────────────────────────────────────
-
+    # ── STRUCTURE ──────────────────────────────────────────────────────────────
     with tab_structure:
-
-        # ── Current database info ────────────────────────────────────────────
         st.subheader("📊 Current Database")
         try:
             total_items   = db.count_items(None)
             active_items  = db.count_items("active")
             total_value   = db.get_inventory_value()
             col1, col2, col3 = st.columns(3)
-            col1.metric("Total Records",  f"{total_items:,}")
-            col2.metric("Active Items",   f"{active_items:,}")
-            col3.metric("Inventory Value",f"${total_value:,.2f}")
+            col1.metric("Total Records",   f"{total_items:,}")
+            col2.metric("Active Items",    f"{active_items:,}")
+            col3.metric("Inventory Value", f"${total_value:,.2f}")
         except Exception as e:
             st.error(f"Could not read DB stats: {e}")
 
         st.markdown("---")
-
-        # ── Rename / Relabel ─────────────────────────────────────────────────
         st.subheader("✏️ Rename / Relabel")
-        sidebar_cfg = st.session_state.get("_sidebar_cfg")
+        sidebar_cfg   = st.session_state.get("_sidebar_cfg")
         current_label = sidebar_cfg.custom_label if sidebar_cfg else "UHA TDECU Stadium"
-
-        new_label = st.text_input(
-            "Display name (shown in sidebar + reports)",
-            value=current_label,
-            key="db_rename_input",
-        )
+        new_label = st.text_input("Display name", value=current_label, key="db_rename_input")
         if st.button("Apply Label", key="db_rename_apply"):
             if sidebar_cfg and new_label.strip():
-                sidebar_cfg.custom_label = new_label.strip()
+                sidebar_cfg.custom_label         = new_label.strip()
                 st.session_state["_sidebar_cfg"] = sidebar_cfg
                 st.success(f"✅ Label updated to: **{new_label.strip()}**")
                 st.rerun()
 
         st.markdown("---")
-
-        # ── Cost Center Assignment ───────────────────────────────────────────
         st.subheader("🏷️ Cost Center Assignment")
-        st.caption(
-            "Assign this database to one or more cost center keys. "
-            "The active cost center controls which DB connection is used for imports."
-        )
-
         current_cc = st.session_state["db"].get("cost_center", "default")
         st.info(f"Active cost center: **{current_cc}**")
-
-        new_cc_name = st.text_input(
-            "New cost center name",
-            value=_mgmt("pending_cc_name", ""),
-            placeholder="e.g. TDECU Stadium",
-            key="cc_name_input",
-        )
-        new_cc_key = re.sub(r'[^a-z0-9_]', '_',
-                            new_cc_name.strip().lower()).strip('_')
+        new_cc_name = st.text_input("New cost center name", placeholder="e.g. TDECU Stadium", key="cc_name_input")
+        new_cc_key  = re.sub(r'[^a-z0-9_]', '_', new_cc_name.strip().lower()).strip('_')
         if new_cc_name.strip():
             st.caption(f"Key will be: `{new_cc_key}`")
-
-        new_cc_desc = st.text_input(
-            "Description (optional)",
-            value=_mgmt("pending_cc_desc", ""),
-            placeholder="e.g. UHA TDECU Stadium — Compass 57231",
-            key="cc_desc_input",
-        )
-
+        new_cc_desc = st.text_input("Description (optional)", placeholder="e.g. UHA TDECU Stadium — Compass 57231", key="cc_desc_input")
         col_add, col_switch = st.columns(2)
         with col_add:
             if st.button("➕ Register Cost Center", use_container_width=True):
                 if new_cc_key:
                     available = st.session_state["db"].get("available", [])
                     if not any(cc["key"] == new_cc_key for cc in available):
-                        available.append({
-                            "key":         new_cc_key,
-                            "name":        new_cc_name.strip(),
-                            "description": new_cc_desc.strip(),
-                        })
+                        available.append({"key": new_cc_key, "name": new_cc_name.strip(), "description": new_cc_desc.strip()})
                         st.session_state["db"]["available"] = available
                     st.success(f"✅ Cost center registered: **{new_cc_key}**")
                     st.rerun()
-
         with col_switch:
-            available = st.session_state["db"].get("available", [])
-            cc_options = [cc["key"] for cc in available] or [current_cc]
-            selected_cc = st.selectbox(
-                "Switch active cost center",
-                options=cc_options,
-                index=cc_options.index(current_cc) if current_cc in cc_options else 0,
-                key="cc_switch_select",
-            )
+            available   = st.session_state["db"].get("available", [])
+            cc_options  = [cc["key"] for cc in available] or [current_cc]
+            selected_cc = st.selectbox("Switch active cost center", options=cc_options,
+                                       index=cc_options.index(current_cc) if current_cc in cc_options else 0,
+                                       key="cc_switch_select")
             if st.button("🔀 Switch", use_container_width=True):
                 st.session_state["db"]["cost_center"] = selected_cc
                 st.success(f"✅ Active cost center → **{selected_cc}**")
                 st.rerun()
 
         st.markdown("---")
-
-        # ── Duplicate / Create New ───────────────────────────────────────────
         st.subheader("📋 Duplicate or Create New Database")
         col_dup, col_new = st.columns(2)
-
         with col_dup:
             st.markdown("**Duplicate current database**")
-            st.caption("Clone all items to a new cost center.")
-            dup_target = st.text_input(
-                "Target cost center key",
-                placeholder="e.g. tdecu_copy",
-                key="dup_target_input",
-            )
+            dup_target = st.text_input("Target cost center key", placeholder="e.g. tdecu_copy", key="dup_target_input")
             if st.button("📋 Duplicate", use_container_width=True, key="dup_btn"):
                 if dup_target.strip():
                     try:
                         items = db.get_all_items(None)
                         duped = 0
                         for item in items:
-                            item_copy = dict(item)
+                            item_copy               = dict(item)
                             item_copy["cost_center"] = dup_target.strip()
-                            # Key stays the same — cost_center is metadata only
                             try:
-                                db.add_item(item_copy, changed_by="duplicate")
+                                db.add_item(item_copy, changed_by=get_changed_by())
                                 duped += 1
                             except Exception:
                                 pass
@@ -1962,26 +1740,15 @@ def page_db_management():
                         st.error(f"Duplicate failed: {e}")
                 else:
                     st.warning("Enter a target cost center key first.")
-
         with col_new:
             st.markdown("**Create new empty database**")
-            st.caption("Register a new cost center with no items.")
-            new_db_key = st.text_input(
-                "New cost center key",
-                placeholder="e.g. softball_complex",
-                key="new_db_key_input",
-            )
+            new_db_key = st.text_input("New cost center key", placeholder="e.g. softball_complex", key="new_db_key_input")
             if st.button("➕ Create Empty", use_container_width=True, key="new_db_btn"):
                 if new_db_key.strip():
                     available = st.session_state["db"].get("available", [])
-                    key_clean = re.sub(r'[^a-z0-9_]', '_',
-                                       new_db_key.strip().lower()).strip('_')
+                    key_clean = re.sub(r'[^a-z0-9_]', '_', new_db_key.strip().lower()).strip('_')
                     if not any(cc["key"] == key_clean for cc in available):
-                        available.append({
-                            "key":         key_clean,
-                            "name":        new_db_key.strip(),
-                            "description": "New cost center",
-                        })
+                        available.append({"key": key_clean, "name": new_db_key.strip(), "description": "New cost center"})
                         st.session_state["db"]["available"] = available
                         st.success(f"✅ New cost center created: **{key_clean}**")
                         st.rerun()
@@ -1990,124 +1757,64 @@ def page_db_management():
                 else:
                     st.warning("Enter a cost center key first.")
 
-    # ── end of tab — structure ────────────────────────────────────────────────
-
-
-    # ──────────────────────────────────────────────────────────────────────────
-    #  TAB — THRESHOLDS
-    # ──────────────────────────────────────────────────────────────────────────
-
+    # ── THRESHOLDS ────────────────────────────────────────────────────────────
     with tab_thresholds:
         st.subheader("🎚️ Variance Flagging Thresholds")
-        st.caption(
-            "Items are flagged during count import when their variance exceeds "
-            "either of these thresholds. Lower values = more flags. "
-            "These apply to the active cost center."
-        )
-
-        thresholds = st.session_state["db_mgmt"]["thresholds"]
-
+        thresholds    = st.session_state["db_mgmt"]["thresholds"]
         col_each, col_val = st.columns(2)
-
         with col_each:
             new_flag_each = st.number_input(
                 "Flag if |unit variance| exceeds",
-                min_value=0,
-                max_value=10000,
-                value=int(thresholds.get("flag_each", 24)),
-                step=1,
-                help="Example: 24 means flag if item count differs by more than 24 units.",
+                min_value=0, max_value=10000,
+                value=int(thresholds.get("flag_each", 24)), step=1,
                 key="threshold_each_input",
             )
-
         with col_val:
             new_flag_value = st.number_input(
                 "Flag if |value variance| exceeds ($)",
-                min_value=0.0,
-                max_value=100000.0,
-                value=float(thresholds.get("flag_value", 50.0)),
-                step=5.0,
-                format="%.2f",
-                help="Example: 50.00 means flag if variance dollar amount exceeds $50.",
+                min_value=0.0, max_value=100000.0,
+                value=float(thresholds.get("flag_value", 50.0)), step=5.0, format="%.2f",
                 key="threshold_value_input",
             )
-
-        # Preview impact
         st.markdown("---")
-        st.caption("**Current thresholds at a glance:**")
         c1, c2 = st.columns(2)
         c1.metric("Unit threshold",  f"± {new_flag_each} units")
         c2.metric("Value threshold", f"± ${new_flag_value:,.2f}")
-
         if st.button("💾 Save Thresholds", type="primary"):
             st.session_state["db_mgmt"]["thresholds"] = {
                 "flag_each":  new_flag_each,
                 "flag_value": new_flag_value,
             }
-            st.success(
-                f"✅ Thresholds saved — "
-                f"units: ±{new_flag_each} · value: ±${new_flag_value:,.2f}"
-            )
+            st.success(f"✅ Thresholds saved — units: ±{new_flag_each} · value: ±${new_flag_value:,.2f}")
 
-        st.markdown("---")
-        st.subheader("ℹ️ What Gets Flagged")
-        st.markdown("""
-| Condition | Flag Reason |
-|---|---|
-| Item not found in DB | Item not found in database |
-| unit variance > threshold | Unit variance exceeds threshold |
-| value variance > threshold | Value variance exceeds threshold |
-
-Flagged items appear in the count import review panel with a 🚩 indicator.
-They are **not blocked** from import — the flag is informational.
-        """)
-
-    # ── end of tab — thresholds ───────────────────────────────────────────────
-
-
-    # ──────────────────────────────────────────────────────────────────────────
-    #  TAB — DANGER ZONE
-    # ──────────────────────────────────────────────────────────────────────────
-
+    # ── DANGER ZONE ───────────────────────────────────────────────────────────
     with tab_danger:
-        st.error(
-            "⚠️ All operations in this section modify or destroy data. "
-            "Create a backup before proceeding."
-        )
+        st.error("⚠️ All operations in this section modify or destroy data. Create a backup before proceeding.")
 
-        # ── Clear Quantities ─────────────────────────────────────────────────
         with st.expander("🔢 Clear All Quantities", expanded=False):
-            st.warning(
-                "Sets **quantity_on_hand = 0** for every active item. "
-                "Item records, prices, GL codes, and history are preserved."
-            )
+            st.warning("Sets **quantity_on_hand = 0** for every active item.")
             try:
                 active_count = db.count_items("active")
                 st.caption(f"Will affect **{active_count:,}** active items.")
             except Exception:
                 pass
-
             confirmed_qty = _mgmt("clear_confirmed") and _mgmt("clear_scope") == "quantities"
-
             if not confirmed_qty:
-                if st.button("🔓 Unlock — Clear Quantities",
-                             key="unlock_clear_qty", type="secondary"):
+                if st.button("🔓 Unlock — Clear Quantities", key="unlock_clear_qty", type="secondary"):
                     _set_mgmt("clear_confirmed", True)
                     _set_mgmt("clear_scope",     "quantities")
                     st.rerun()
             else:
+                reason = st.text_input("Reason for clearing quantities (required)", key="clear_qty_reason")
                 col_go, col_cancel = st.columns(2)
                 with col_go:
-                    if st.button("🔢 Confirm — Zero All Quantities",
-                                 key="confirm_clear_qty", type="primary",
-                                 use_container_width=True):
+                    if st.button("🔢 Confirm — Zero All Quantities", key="confirm_clear_qty",
+                                 type="primary", use_container_width=True,
+                                 disabled=not reason.strip()):
                         try:
-                            with db.get_conn() as conn:  # type: ignore
+                            with db.get_conn() as conn:
                                 cur = conn.cursor()
-                                cur.execute(
-                                    "UPDATE items SET quantity_on_hand = 0 "
-                                    "WHERE record_status = 'active'"
-                                )
+                                cur.execute("UPDATE items SET quantity_on_hand = 0 WHERE record_status = 'active'")
                                 affected = cur.rowcount
                             reset_db_mgmt_confirm(st.session_state)
                             st.success(f"✅ Zeroed quantities on {affected:,} items.")
@@ -2115,40 +1822,32 @@ They are **not blocked** from import — the flag is informational.
                         except Exception as e:
                             st.error(f"Operation failed: {e}")
                 with col_cancel:
-                    if st.button("Cancel", key="cancel_clear_qty",
-                                 use_container_width=True):
+                    if st.button("Cancel", key="cancel_clear_qty", use_container_width=True):
                         reset_db_mgmt_confirm(st.session_state)
                         st.rerun()
 
-        # ── Clear All Items ──────────────────────────────────────────────────
         with st.expander("🗑️ Clear All Items", expanded=False):
-            st.error(
-                "Removes **all item records** from the database. "
-                "GL code mappings, import logs, and cost center config are preserved. "
-                "This cannot be undone without a backup."
-            )
+            st.error("Removes **all item records** from the database. Cannot be undone without a backup.")
             try:
                 total_count = db.count_items(None)
                 st.caption(f"Will delete **{total_count:,}** total item records.")
             except Exception:
                 pass
-
             confirmed_all = _mgmt("clear_confirmed") and _mgmt("clear_scope") == "all_items"
-
             if not confirmed_all:
-                if st.button("🔓 Unlock — Clear All Items",
-                             key="unlock_clear_all", type="secondary"):
+                if st.button("🔓 Unlock — Clear All Items", key="unlock_clear_all", type="secondary"):
                     _set_mgmt("clear_confirmed", True)
                     _set_mgmt("clear_scope",     "all_items")
                     st.rerun()
             else:
+                reason = st.text_input("Reason for deleting all items (required)", key="clear_all_reason")
                 col_go, col_cancel = st.columns(2)
                 with col_go:
-                    if st.button("🗑️ Confirm — Delete All Items",
-                                 key="confirm_clear_all", type="primary",
-                                 use_container_width=True):
+                    if st.button("🗑️ Confirm — Delete All Items", key="confirm_clear_all",
+                                 type="primary", use_container_width=True,
+                                 disabled=not reason.strip()):
                         try:
-                            with db.get_conn() as conn:  # type: ignore
+                            with db.get_conn() as conn:
                                 cur = conn.cursor()
                                 cur.execute("DELETE FROM items")
                                 affected = cur.rowcount
@@ -2158,52 +1857,35 @@ They are **not blocked** from import — the flag is informational.
                         except Exception as e:
                             st.error(f"Operation failed: {e}")
                 with col_cancel:
-                    if st.button("Cancel", key="cancel_clear_all",
-                                 use_container_width=True):
+                    if st.button("Cancel", key="cancel_clear_all", use_container_width=True):
                         reset_db_mgmt_confirm(st.session_state)
                         st.rerun()
 
-        # ── Full Reset ───────────────────────────────────────────────────────
         with st.expander("☢️ Full Reset", expanded=False):
-            st.error(
-                "**Wipes the entire database** — all items, history, import logs, "
-                "and variance records. GL code mappings are also cleared. "
-                "This is irreversible without a backup."
-            )
+            st.error("**Wipes the entire database.** Irreversible without a backup.")
             current_cc = st.session_state["db"].get("cost_center", "default")
-            st.caption(
-                f"To confirm, type the active cost center name exactly: "
-                f"**`{current_cc}`**"
-            )
-
-            reset_confirm_text = st.text_input(
-                "Type cost center name to unlock",
-                key="full_reset_confirm_input",
-                placeholder=current_cc,
-            )
+            st.caption(f"Type the active cost center name exactly: **`{current_cc}`**")
+            reset_confirm_text = st.text_input("Type cost center name to unlock",
+                                               key="full_reset_confirm_input", placeholder=current_cc)
             unlock_ready = reset_confirm_text.strip() == current_cc.strip()
-
             if not unlock_ready:
-                st.button("☢️ Full Reset", disabled=True,
-                          key="full_reset_btn_disabled",
-                          help="Type the cost center name above to enable.")
+                st.button("☢️ Full Reset", disabled=True, key="full_reset_btn_disabled")
             else:
-                confirmed_reset = _mgmt("clear_confirmed") and \
-                                  _mgmt("clear_scope") == "full_reset"
+                confirmed_reset = _mgmt("clear_confirmed") and _mgmt("clear_scope") == "full_reset"
                 if not confirmed_reset:
-                    if st.button("🔓 Unlock Full Reset",
-                                 key="unlock_full_reset", type="secondary"):
+                    if st.button("🔓 Unlock Full Reset", key="unlock_full_reset", type="secondary"):
                         _set_mgmt("clear_confirmed", True)
                         _set_mgmt("clear_scope",     "full_reset")
                         st.rerun()
                 else:
+                    reason = st.text_input("Reason for full reset (required)", key="full_reset_reason")
                     col_go, col_cancel = st.columns(2)
                     with col_go:
-                        if st.button("☢️ Confirm Full Reset",
-                                     key="confirm_full_reset", type="primary",
-                                     use_container_width=True):
+                        if st.button("☢️ Confirm Full Reset", key="confirm_full_reset",
+                                     type="primary", use_container_width=True,
+                                     disabled=not reason.strip()):
                             try:
-                                with db.get_conn() as conn:  # type: ignore
+                                with db.get_conn() as conn:
                                     cur = conn.cursor()
                                     cur.execute("DELETE FROM count_variance_detail")
                                     cur.execute("DELETE FROM count_imports")
@@ -2217,23 +1899,15 @@ They are **not blocked** from import — the flag is informational.
                             except Exception as e:
                                 st.error(f"Full reset failed: {e}")
                     with col_cancel:
-                        if st.button("Cancel", key="cancel_full_reset",
-                                     use_container_width=True):
+                        if st.button("Cancel", key="cancel_full_reset", use_container_width=True):
                             reset_db_mgmt_confirm(st.session_state)
                             st.rerun()
-
-    # ── end of tab — danger zone ──────────────────────────────────────────────
 
 # ── end of page — database management ────────────────────────────────────────
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  MAIN NAV — UPDATED ROUTER
-#  Replace the existing main() function in app.py with this version.
-#  Changes from original:
-#    1. init_session_state() called once at bootstrap
-#    2. db_management and import_mode_selector routes added
-#    3. sidebar nav gets Database and Mode Selector entries
+#  MAIN
 # ──────────────────────────────────────────────────────────────────────────────
 
 def main():
@@ -2251,6 +1925,10 @@ def main():
 
     init_session_state(st.session_state)
 
+    # ── Auth gate — must resolve identity before ANY page renders ─────────────
+    if not require_auth(_get_db()):
+        return   # login form is showing — stop here
+
     reg         = st.session_state["_registry"]
     sidebar_cfg = st.session_state["_sidebar_cfg"]
     menubar     = MenuBar(reg)
@@ -2265,6 +1943,10 @@ def main():
     # ── Sidebar ───────────────────────────────────────────────────────────────
     if sidebar_cfg.visible:
         with st.sidebar:
+            # User identity badge — always first
+            render_user_badge()
+            st.markdown("---")
+
             if sidebar_cfg.show_cost_center:
                 cc = st.session_state["db"].get("cost_center", "default")
                 st.markdown(f"**{sidebar_cfg.custom_label}**")
@@ -2298,10 +1980,9 @@ def main():
         with st.expander("🔧 Module Versions", expanded=False):
             import importlib
             _modules = [
-                "app", "database", "importer",
+                "app", "database", "importer", "auth",
                 "count_importer", "gl_manager",
                 "ui_skeleton", "session_state", "status_bar",
-                "count_sheet_generator", "page_count_sheets",
             ]
             for _name in _modules:
                 try:
@@ -2310,7 +1991,6 @@ def main():
                 except Exception:
                     _ver = "error"
                 st.caption(f"`{_name}` — v{_ver}")
-    # ── end of module versions ────────────────────────────────────────────────
 
     # ── Route to page ─────────────────────────────────────────────────────────
     if   page == "dashboard":        page_dashboard()
@@ -2322,14 +2002,13 @@ def main():
     elif page == "history":          page_history()
     elif page == "export":           page_export()
     elif page == "db_management":    page_db_management()
-    elif page in ("settings",
-                  "settings_sidebar",
-                  "settings_prefs"):  page_settings()
-    else:                            page_dashboard()
+    elif page in ("settings", "settings_sidebar", "settings_prefs"):
+        page_settings()
+    else:
+        page_dashboard()
 
 
 if __name__ == "__main__":
     main()
 
-
-# ── end of main nav ───────────────────────────────────────────────────────────
+# ── end of main ───────────────────────────────────────────────────────────────

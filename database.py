@@ -19,7 +19,7 @@ from contextlib import contextmanager
 #  VERSION
 # ──────────────────────────────────────────────────────────────────────────────
 
-__version__ = "3.0.4"
+__version__ = "3.0.5"
 
 # ── end of version ────────────────────────────────────────────────────────────
 
@@ -210,15 +210,6 @@ class InventoryDatabase:
                     flag_reason      TEXT
                 );
 
-                CREATE INDEX IF NOT EXISTS idx_items_description ON items(description);
-                CREATE INDEX IF NOT EXISTS idx_items_gl_code     ON items(gl_code);
-                CREATE INDEX IF NOT EXISTS idx_items_vendor      ON items(vendor);
-                CREATE INDEX IF NOT EXISTS idx_history_item_key  ON item_history(item_key);
-                CREATE INDEX IF NOT EXISTS idx_import_log_hash   ON import_log(file_hash);
-                CREATE INDEX IF NOT EXISTS idx_count_imports_date     ON count_imports(count_date DESC);
-                CREATE INDEX IF NOT EXISTS idx_count_variance_import  ON count_variance_detail(import_id);
-                CREATE INDEX IF NOT EXISTS idx_count_variance_item    ON count_variance_detail(item_key);
-
                 CREATE TABLE IF NOT EXISTS count_overrides (
                     id              SERIAL PRIMARY KEY,
                     item_key        TEXT NOT NULL,
@@ -246,8 +237,32 @@ class InventoryDatabase:
                     ('default_case_behavior', 'ignore')
                 ON CONFLICT (setting_key) DO NOTHING;
 
-                CREATE INDEX IF NOT EXISTS idx_count_overrides_key  ON count_overrides(item_key);
-                CREATE INDEX IF NOT EXISTS idx_count_overrides_cc   ON count_overrides(cost_center);
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id      SERIAL PRIMARY KEY,
+                    username     TEXT UNIQUE NOT NULL,
+                    display_name TEXT,
+                    email        TEXT,
+                    pin_hash     TEXT,
+                    role         TEXT NOT NULL DEFAULT 'editor',
+                    is_active    BOOLEAN DEFAULT TRUE,
+                    auth_method  TEXT DEFAULT 'login_form',
+                    created_at   TIMESTAMPTZ DEFAULT NOW(),
+                    last_login   TIMESTAMPTZ,
+                    notes        TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_items_description ON items(description);
+                CREATE INDEX IF NOT EXISTS idx_items_gl_code     ON items(gl_code);
+                CREATE INDEX IF NOT EXISTS idx_items_vendor      ON items(vendor);
+                CREATE INDEX IF NOT EXISTS idx_history_item_key  ON item_history(item_key);
+                CREATE INDEX IF NOT EXISTS idx_import_log_hash   ON import_log(file_hash);
+                CREATE INDEX IF NOT EXISTS idx_count_imports_date     ON count_imports(count_date DESC);
+                CREATE INDEX IF NOT EXISTS idx_count_variance_import  ON count_variance_detail(import_id);
+                CREATE INDEX IF NOT EXISTS idx_count_variance_item    ON count_variance_detail(item_key);
+                CREATE INDEX IF NOT EXISTS idx_count_overrides_key    ON count_overrides(item_key);
+                CREATE INDEX IF NOT EXISTS idx_count_overrides_cc     ON count_overrides(cost_center);
+                CREATE INDEX IF NOT EXISTS idx_users_username         ON users(username);
+                CREATE INDEX IF NOT EXISTS idx_users_email            ON users(email);
             """)
 
     # ── end of schema ─────────────────────────────────────────────────────────
@@ -266,6 +281,92 @@ class InventoryDatabase:
         return f"{name}||{pack}" if pack else f"{name}||CASE"
 
     # ── end of key builder ────────────────────────────────────────────────────
+
+
+    # ──────────────────────────────────────────────────────────────────────────
+    #  USER MANAGEMENT
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def get_user_by_username(self, username: str) -> Optional[Dict]:
+        """Return a user row by username, or None if not found."""
+        with get_conn() as conn:
+            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cur.execute(
+                "SELECT * FROM users WHERE username = %s",
+                (username.strip().lower(),)
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+    def get_user_by_email(self, email: str) -> Optional[Dict]:
+        """Return a user row by email, or None if not found."""
+        with get_conn() as conn:
+            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cur.execute(
+                "SELECT * FROM users WHERE LOWER(email) = LOWER(%s)",
+                (email.strip(),)
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+    def get_all_users(self) -> List[Dict]:
+        """Return all users ordered by username."""
+        with get_conn() as conn:
+            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cur.execute("SELECT * FROM users ORDER BY username")
+            return [dict(r) for r in cur.fetchall()]
+
+    def upsert_user(self, user_data: Dict) -> bool:
+        """
+        Insert or update a user record.
+        Only the fields present in user_data are written — missing fields
+        are left unchanged on conflict.
+        """
+        username = (user_data.get('username') or '').strip().lower()
+        if not username:
+            return False
+        try:
+            with get_conn() as conn:
+                cur = conn.cursor()
+                # Build dynamic SET clause from supplied fields (excluding username)
+                settable = {k: v for k, v in user_data.items() if k != 'username'}
+                if not settable:
+                    # Nothing to set — just ensure the row exists
+                    cur.execute("""
+                        INSERT INTO users (username) VALUES (%s)
+                        ON CONFLICT (username) DO NOTHING
+                    """, (username,))
+                    return True
+
+                cols   = list(settable.keys())
+                vals   = list(settable.values())
+                set_clause = ", ".join(f"{c} = EXCLUDED.{c}" for c in cols)
+                col_str  = ", ".join(cols)
+                ph_str   = ", ".join(["%s"] * len(cols))
+                cur.execute(f"""
+                    INSERT INTO users (username, {col_str})
+                    VALUES (%s, {ph_str})
+                    ON CONFLICT (username)
+                    DO UPDATE SET {set_clause}
+                """, [username] + vals)
+            return True
+        except Exception as e:
+            print(f"Error upserting user {username}: {e}")
+            return False
+
+    def update_last_login(self, username: str) -> None:
+        """Stamp last_login = NOW() for the given user."""
+        try:
+            with get_conn() as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    "UPDATE users SET last_login = NOW() WHERE username = %s",
+                    (username.strip().lower(),)
+                )
+        except Exception as e:
+            print(f"Error updating last_login for {username}: {e}")
+
+    # ── end of user management ────────────────────────────────────────────────
 
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -718,11 +819,6 @@ class InventoryDatabase:
     # ──────────────────────────────────────────────────────────────────────────
 
     def get_items_bulk(self, keys: List[str]) -> Dict[str, Dict]:
-        """
-        Fetch multiple items by key in a single query.
-        Returns {item_key: item_dict}.  Missing keys simply won't appear
-        in the result — callers treat absence as 'not in DB'.
-        """
         if not keys:
             return {}
         with get_conn() as conn:
@@ -737,17 +833,11 @@ class InventoryDatabase:
 
 
     # ──────────────────────────────────────────────────────────────────────────
-    #  COUNT OVERRIDES  —  per-item qty correction rules (e.g. MOG items with
-    #  wrong pack ratios that cannot be edited in the source system)
+    #  COUNT OVERRIDES
     # ──────────────────────────────────────────────────────────────────────────
 
     def get_count_overrides_bulk(self, keys: List[str],
                                   cost_center: str = "*") -> Dict[str, Dict]:
-        """
-        Fetch all active overrides for a list of item keys in one query.
-        Resolution order: exact cost_center match wins over global '*'.
-        Returns {item_key: override_dict}.
-        """
         if not keys:
             return {}
         try:
@@ -764,9 +854,8 @@ class InventoryDatabase:
                              CASE WHEN cost_center = %s THEN 0 ELSE 1 END
                 """, (list(keys), cost_center, cost_center))
                 return {row["item_key"]: dict(row) for row in cur.fetchall()}
-        except (psycopg2.ProgrammingError, psycopg2.OperationalError, 
+        except (psycopg2.ProgrammingError, psycopg2.OperationalError,
                 psycopg2.errors.UndefinedTable) as e:
-            # Table doesn't exist yet (first run before create_tables has executed)
             print(f"Count overrides table not found (expected on first run): {e}")
             return {}
         except Exception as e:
@@ -778,7 +867,6 @@ class InventoryDatabase:
                                cost_center: str = "*",
                                notes: str = "",
                                created_by: str = "user") -> bool:
-        """Insert or update a count override rule."""
         try:
             with get_conn() as conn:
                 cur = conn.cursor()
@@ -801,7 +889,6 @@ class InventoryDatabase:
 
     def delete_count_override(self, item_key: str,
                                cost_center: str = "*") -> bool:
-        """Soft-delete an override (sets is_active=False)."""
         try:
             with get_conn() as conn:
                 cur = conn.cursor()
@@ -816,7 +903,6 @@ class InventoryDatabase:
             return False
 
     def get_all_count_overrides(self) -> List[Dict]:
-        """Return all active overrides for the override manager UI."""
         with get_conn() as conn:
             cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
             cur.execute("""
@@ -832,11 +918,10 @@ class InventoryDatabase:
 
 
     # ──────────────────────────────────────────────────────────────────────────
-    #  COUNT OVERRIDE SETTINGS  —  user preferences for default scope/behavior
+    #  COUNT OVERRIDE SETTINGS
     # ──────────────────────────────────────────────────────────────────────────
 
     def get_override_setting(self, key: str, default: str = "") -> str:
-        """Get a single count override setting by key."""
         try:
             with get_conn() as conn:
                 cur = conn.cursor()
@@ -850,7 +935,6 @@ class InventoryDatabase:
             return default
 
     def set_override_setting(self, key: str, value: str) -> bool:
-        """Persist a count override setting."""
         try:
             with get_conn() as conn:
                 cur = conn.cursor()
@@ -876,7 +960,8 @@ class InventoryDatabase:
     def _apply_update(self, key: str, updates: Dict[str, Any],
                       change_source: str = "system",
                       source_document: str = None,
-                      changed_by: str = "system") -> bool:
+                      changed_by: str = "system",
+                      change_reason: str = None) -> bool:
         if not updates:
             return True
         current = self.get_item(key)
@@ -901,6 +986,7 @@ class InventoryDatabase:
                         change_source=change_source,
                         source_document=source_document,
                         changed_by=changed_by,
+                        change_reason=change_reason,
                     )
             return True
         except Exception as e:
