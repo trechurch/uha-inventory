@@ -57,9 +57,8 @@ class FeatureRegistry:
 #
 #  page_key   → renders as a plain href="?page=<key>" link (no JS needed,
 #               works inside Streamlit's iframe without restriction)
-#  js_action  → a short key string (e.g. "new-tab", "print") matched against
-#               the ACTIONS dict in status_bar.py's companion <script>.
-#               The script attaches the real handler via window.parent.
+#  js_action  → renders as an onclick= handler for browser-native calls
+#               (window.open, window.print, navigator.share, etc.)
 #               These two are mutually exclusive — page_key wins if both set.
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -98,9 +97,15 @@ class MenuBar:
             MenuItem(label="File", children=[
 
                 # ── Browser-native (JS only, no page routing) ─────────────────
-                MenuItem("New Tab",       icon="🗋", js_action="new-tab"),
-                MenuItem("Duplicate Tab", icon="⧉", js_action="dup-tab"),
-                MenuItem("New Window",    icon="⬜", js_action="new-window"),
+                MenuItem("New Tab",
+                         icon="🗋",
+                         js_action="window.open(window.location.href,'_blank');"),
+                MenuItem("Duplicate Tab",
+                         icon="⧉",
+                         js_action="window.open(window.location.href,'_blank');"),
+                MenuItem("New Window",
+                         icon="⬜",
+                         js_action="window.open(window.location.href,'_blank','width=1400,height=900');"),
 
                 MenuItem("", separator=True),
 
@@ -119,8 +124,19 @@ class MenuBar:
                 MenuItem("", separator=True),
 
                 # ── Share / Print / Export ────────────────────────────────────
-                MenuItem("Share",  icon="↗", js_action="share"),
-                MenuItem("Print",  icon="🖨", js_action="print"),
+                MenuItem("Share",
+                         icon="↗",
+                         js_action=(
+                             "if(navigator.share){"
+                             "  navigator.share({title:'UHA Inventory',url:window.location.href})"
+                             "} else {"
+                             "  navigator.clipboard.writeText(window.location.href);"
+                             "  alert('Link copied to clipboard');"
+                             "}"
+                         )),
+                MenuItem("Print",
+                         icon="🖨",
+                         js_action="window.print();"),
                 MenuItem("Export",          page_key="export",         icon="📤",
                          feature_flag="export"),
 
@@ -133,9 +149,19 @@ class MenuBar:
                 MenuItem("", separator=True),
 
                 # ── Window / tab controls ─────────────────────────────────────
-                MenuItem("Close Tab",    icon="✕", js_action="close-tab"),
-                MenuItem("Close Window", icon="⊠", js_action="close-window"),
-                MenuItem("Exit",         icon="⏻", js_action="exit"),
+                MenuItem("Close Tab",
+                         icon="✕",
+                         js_action="window.close();"),
+                MenuItem("Close Window",
+                         icon="⊠",
+                         js_action="window.close();"),
+                MenuItem("Exit",
+                         icon="⏻",
+                         js_action=(
+                             "if(confirm('Close UHA Inventory?')){"
+                             "  window.close();"
+                             "}"
+                         )),
             ]),
 
             # ── Inventory ────────────────────────────────────────────────────
