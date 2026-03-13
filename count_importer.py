@@ -1,17 +1,31 @@
-
 # ──────────────────────────────────────────────────────────────────────────────
-#  count_importer.py  —  On-Hand / Cost-Center Count Import
-#  Handles the three export formats from the myOrders count system:
-#    • CSV  — Separated, single location, sorted by Seq
-#    • XLSX — Separated, all locations, column[0] = Classification
-#    • PDF  — Combined (slash-delimited), all locations, section headers
+#  count_importer.py  —  PAC / myOrders Count Sheet Parser
+#  Format: export(24) style — two rows per item (Case row + Each row)
 #
-#  "Separated" means 2 rows per item (CS row + EA row).
-#  "Combined"  means 1 row per item with "0.00 CS/16.00 Each" style values.
+#  PARSING RULES (derived from real count sheets):
 #
-#  All three produce the same normalized CountRecord list, which is then
-#  diff'd against the database to generate a variance report before any
-#  writes are committed.
+#  ROW PAIRING
+#    Every item appears exactly twice — same Seq, same Description.
+#    Row 1: Case  — qty, price, total for the case unit
+#    Row 2: Each  — qty, price, total for the each unit
+#    Key: Item Description || Pack Type (uppercase, double-pipe)
+#
+#  MATH (ground truth — always holds)
+#    each_qty  * each_price  = Total Price  (each row)
+#    case_qty  * case_price  = Total Price  (case row)
+#    If Total Price > 0 and price > 0:  qty = Total Price / price  (safer than raw qty)
+#
+#  SECTION CLASSIFICATION (by first item description in section)
+#    LIQUOR        — description starts with 3-char spirit prefix (BRB CRD GIN …)
+#    NON-CHARGEABLE — description matches any NON_CHARGEABLE_KEYWORDS keyword
+#    CHARGEABLE    — everything else
+#
+#  LOCATION BOUNDARY STATE MACHINE
+#    CHARGEABLE    → seq reset → NON-CHARGEABLE  (same location)
+#    NON-CHARGEABLE → seq reset → classify next section:
+#                       LIQUOR      → same location
+#                       CHARGEABLE  → NEW LOCATION
+#    LIQUOR        → seq reset → always NEW LOCATION
 # ──────────────────────────────────────────────────────────────────────────────
 
 import re
@@ -19,62 +33,47 @@ import io
 import uuid
 import hashlib
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, date
 from typing import List, Dict, Optional, Tuple
 
 import pandas as pd
 
-from importer import normalize_pack_type, detect_encoding
-
-# ── end of imports ────────────────────────────────────────────────────────────
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  VERSION
-# ──────────────────────────────────────────────────────────────────────────────
-
-__version__ = "3.0.5"
-
-# ── end of version ────────────────────────────────────────────────────────────
+__version__ = "4.0.0"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  CONSTANTS
+#  CLASSIFICATION CONSTANTS
 # ──────────────────────────────────────────────────────────────────────────────
 
-# UOM tokens that identify a CASE-level row in separated format
-# '1' is included because BIBs and single-unit bags (1/5GAL, 1/250, 50/1lb)
-# use '1' as their case UOM in myOrders exports
-CASE_UOMS = {'case', 'cs', 'cases', 'cse', 'ctn', '1'}
+LIQUOR_PREFIXES = {'BRB', 'CRD', 'GIN', 'RUM', 'SCT', 'TEQ', 'VOD', 'WSK'}
 
-# UOM tokens that identify an EACH-level row in separated format
-EACH_UOMS = {'each', 'ea', 'bx', 'box', 'sleeve', 'slv', 'bag'}
-
-# Column aliases used in count export files
-COUNT_COL_MAP = {
-    'SEQ':                  'seq',
-    'PACK TYPE':            'pack_type',
-    'LAST INVENTORY QTY':   'last_qty',
-    'INV COUNT':            'inv_count',
-    'ITEM DESCRIPTION':     'description',
-    'UOM':                  'uom',
-    'PRICE':                'price',
-    'TOTAL PRICE':          'total_price',
-    'GROUPED BY: CLASSIFICATION': 'location',
-    # XLSX has location as an unnamed first column
+NON_CHARGEABLE_KEYWORDS = {
+    # BIB / beverage supply
+    'BIB', 'SYRUP', 'BAG IN BOX',
+    # Beverage non-chargeable
+    'LID', 'STRAW', 'SLEEVE',
+    # Food ingredients & condiments
+    'MUSTARD', 'KETCHUP', 'RELISH', 'JALAPENO', 'PEPPER', 'CHILI',
+    'SAUCE CHEESE', 'CHEESE SAUCE', 'CHEESE CHDR', 'CHEESE SHARP',
+    'BUN', 'ROLL',
+    'CHIP CORN', 'CHIP TORTILLA WHT',
+    # Food prep & sanitation
+    'GLOVE', 'HAIRNET', 'SOAP', 'SANITIZER',
+    'LINER TRASH', 'TRASH BAG', 'TRASH LINER',
+    'PAN COATING', 'DRYWAX', 'WRAP SAND',
+    'NAPKIN', 'FORK', 'KNIFE', 'SPOON',
+    'CUP PORTION', 'PORTION CUP',
+    # Paper / packaging
+    'FOIL', 'PLASTIC WRAP',
+    # Tea / coffee
+    'TEA BAG', 'COFFEE', 'CREAMER', 'SUGAR',
 }
 
-# Phrases that indicate a header / skip row in the count file
-SKIP_PHRASES = [
-    'property of compass group', 'printed by', 'page',
-    'seq', 'pack type', 'last inventory', 'inv count',
-    'grouped by', 'track market->non', 'non-chargeable',
-]
+# UOM strings that mean CASE
+CASE_UOMS = {'CASE', 'CS', 'CTN', 'CA', 'CT', 'BOX', 'BX'}
 
-# Default variance flagging thresholds
-DEFAULT_FLAG_EACH  = 24    # flag if |variance_each| > this many units
-DEFAULT_FLAG_VALUE = 50.0  # flag if |variance $| > this amount
-
-# ── end of constants ─────────────────────────────────────────────────────────
+# UOM strings that mean EACH
+EACH_UOMS = {'EACH', 'EA', 'EA.', 'E', '1', 'BAG', 'BG'}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -83,984 +82,667 @@ DEFAULT_FLAG_VALUE = 50.0  # flag if |variance $| > this amount
 
 @dataclass
 class CountRecord:
-    """One normalized item from a count export file."""
-    location:       str
-    seq:            str
+    """One fully-resolved item from the count sheet."""
+    seq:              str
     item_description: str
-    pack_type:      str
-    item_key:       str          # "DESCRIPTION||PACK_TYPE"
-    last_qty_case:  float = 0.0
-    last_qty_each:  float = 0.0
-    count_qty_case: float = 0.0
-    count_qty_each: float = 0.0
-    price_case:     float = 0.0
-    price_each:     float = 0.0
-    total_price:    float = 0.0
-    uom_case:       str   = "CS"
-    uom_each:       str   = "EA"
-    is_chargeable:  bool  = True
+    pack_type:        str
+    item_key:         str          # DESCRIPTION||PACK_TYPE
+
+    # Case values
+    case_uom:         str
+    last_qty_case:    float
+    count_qty_case:   float
+    price_case:       float
+
+    # Each values
+    each_uom:         str
+    last_qty_each:    float
+    count_qty_each:   float
+    price_each:       float
+
+    # Totals from file (ground truth)
+    total_price_case: float
+    total_price_each: float
+
+    # Classification
+    location_num:     int
+    classification:   str          # CHARGEABLE | NON-CHARGEABLE | LIQUOR
+    is_chargeable:    bool
+
+    # Derived
+    total_price:      float = 0.0  # case total + each total
+    verified:         bool  = True  # math check passed
 
 
 @dataclass
-class VarianceRecord:
-    """One item's count vs. database comparison."""
-    record:          CountRecord
-    db_qty:          float        # current quantity_on_hand in DB
-    db_price_each:   float        # current price_each in DB
-    new_qty:         float        # what we'll write (count_qty_each)
-    variance_each:   float        # new_qty - db_qty
-    variance_value:  float        # variance_each * effective_price
-    in_db:           bool         # False = item not found in DB
-    is_flagged:      bool         = False
-    flag_reason:     str          = ""
-
-
-@dataclass
-class CountImportMeta:
-    """Metadata for a count import session."""
-    import_id:    str   = field(default_factory=lambda: str(uuid.uuid4())[:12])
-    source_file:  str   = ""
-    file_format:  str   = ""      # csv | xlsx | pdf
-    data_layout:  str   = ""      # separated | combined
-    count_type:   str   = "complete"   # complete | partial
-    count_date:   str   = ""
-    cost_center:  str   = "UHA TDECU Stadium"
-    imported_by:  str   = "user"
-    file_hash:    str   = ""
-
-# ── end of data classes ───────────────────────────────────────────────────────
+class ParseResult:
+    records:       List[CountRecord]
+    location_count: int
+    section_count:  int
+    row_count:      int
+    skipped_rows:   int
+    warnings:       List[str]
+    math_errors:    List[str]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  SCALAR + PARSE HELPERS
+#  CLASSIFICATION HELPERS
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _scalar(val):
-    """Return plain Python scalar, never a pandas Series."""
-    if isinstance(val, pd.Series):
-        val = val.iloc[0] if not val.empty else None
-    if val is None:
-        return None
-    if isinstance(val, float) and pd.isna(val):
-        return None
-    return val
+def _classify(description: str) -> str:
+    desc = description.strip().upper()
+    if desc[:3] in LIQUOR_PREFIXES:
+        return 'LIQUOR'
+    for kw in NON_CHARGEABLE_KEYWORDS:
+        if kw in desc:
+            return 'NON-CHARGEABLE'
+    return 'CHARGEABLE'
 
 
-def _to_float(val) -> float:
-    """Convert a value to float, stripping $, commas, whitespace."""
-    val = _scalar(val)
-    if val is None:
+def _is_case_uom(uom: str) -> bool:
+    return uom.strip().upper() in CASE_UOMS
+
+
+def _normalize_uom(uom: str) -> str:
+    u = uom.strip().upper()
+    if u in CASE_UOMS:
+        return 'CASE'
+    if u in EACH_UOMS:
+        return 'EACH'
+    return u
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  VALUE CLEANERS
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _clean_qty(val) -> float:
+    """Parse '8.00 Case', '0.75', '1.5 CS' → float."""
+    if val is None or (isinstance(val, float) and pd.isna(val)):
         return 0.0
-    s = re.sub(r'[$,\s]', '', str(val))
+    s = str(val).strip()
+    # Extract leading number
+    m = re.match(r'^\s*(-?\d+\.?\d*)', s)
+    return float(m.group(1)) if m else 0.0
+
+
+def _clean_price(val) -> float:
+    """Parse '$16.56', '16.56', '' → float."""
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return 0.0
+    s = str(val).strip().replace('$', '').replace(',', '')
     try:
         return float(s)
-    except (ValueError, TypeError):
+    except ValueError:
         return 0.0
-
-
-def _parse_combined_qty(text: str) -> Tuple[float, str, float, str]:
-    """
-    Parse "0.00 CS/16.00 Each" or "14.00 CS/0.00 EA" into
-    (case_qty, case_uom, each_qty, each_uom).
-    Returns (0,0,0,0) on failure.
-    """
-    if not text:
-        return 0.0, "CS", 0.0, "EA"
-    text = str(text).strip()
-    # Pattern: number uom / number uom
-    m = re.match(
-        r'([\d.]+)\s*([A-Za-z]+)\s*/\s*([\d.]+)\s*([A-Za-z]+)',
-        text
-    )
-    if m:
-        return (
-            float(m.group(1)), m.group(2).upper(),
-            float(m.group(3)), m.group(4).upper(),
-        )
-    # Fallback: single number
-    m2 = re.match(r'([\d.]+)', text)
-    if m2:
-        return float(m2.group(1)), "CS", 0.0, "EA"
-    return 0.0, "CS", 0.0, "EA"
-
-
-def _parse_combined_price(text: str) -> Tuple[float, float]:
-    """
-    Parse "$101.63/$0.10" into (case_price, each_price).
-    """
-    if not text:
-        return 0.0, 0.0
-    text = str(text).strip()
-    parts = text.split('/')
-    if len(parts) >= 2:
-        return _to_float(parts[0]), _to_float(parts[1])
-    return _to_float(text), 0.0
 
 
 def _build_key(description: str, pack_type: str) -> str:
-    """Canonical key: 'DESCRIPTION||PACK_TYPE' — pack_type normalized to match DB."""
     desc = str(description or '').strip().upper()
-    pack = normalize_pack_type(pack_type)   # CS→CASE, EA→EACH, etc.
-    if not desc:
-        return ''
+    pack = str(pack_type or '').strip().upper()
     return f"{desc}||{pack}" if pack else f"{desc}||CASE"
 
 
-def _is_skip_line(text: str) -> bool:
-    """True if this line is a page header, column header, or metadata row."""
-    low = str(text or '').strip().lower()
-    if not low:
-        return True
-    return any(p in low for p in SKIP_PHRASES)
+# ──────────────────────────────────────────────────────────────────────────────
+#  MATH VERIFIER
+# ──────────────────────────────────────────────────────────────────────────────
 
-
-def _file_hash(content: bytes) -> str:
-    return hashlib.sha256(content).hexdigest()[:16]
-
-# ── end of scalar + parse helpers ────────────────────────────────────────────
+def _verify_math(qty: float, price: float, total: float,
+                 label: str) -> Tuple[float, bool, str]:
+    """
+    Ground truth: qty * price = total.
+    If total > 0 and price > 0, recalculate qty from total (more reliable).
+    Returns (verified_qty, passed, warning_msg).
+    """
+    if price <= 0:
+        return qty, True, ''
+    if total > 0:
+        calc_qty  = round(total / price, 4)
+        calc_total = round(qty * price, 2)
+        if abs(calc_total - total) > 0.02:
+            # Trust total/price over raw qty
+            return calc_qty, False, (
+                f"{label}: raw qty={qty} × price=${price} = ${calc_total} "
+                f"≠ file total ${total} → using {calc_qty}"
+            )
+        return qty, True, ''
+    return qty, True, ''
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  FORMAT DETECTION
+#  CORE PARSER
 # ──────────────────────────────────────────────────────────────────────────────
 
-def detect_format(filename: str, content_bytes: bytes) -> Dict:
+class CountSheetParser:
     """
-    Returns {
-        'ext':          'csv' | 'xlsx' | 'pdf',
-        'layout':       'separated' | 'combined',
-        'has_location': bool,
-        'description':  str   (human-readable summary)
-    }
+    Parses export(24)-style count CSVs.
+    Columns: Seq | Pack Type | Last Inventory Qty | Inv Count |
+             Item Description | UOM | Price | Total Price
     """
-    ext = filename.lower().rsplit('.', 1)[-1] if '.' in filename else ''
 
-    if ext == 'pdf':
-        return {
-            'ext': 'pdf', 'layout': 'combined', 'has_location': True,
-            'description': 'PDF — Combined (slash-delimited), all locations',
-        }
-
-    # For CSV / XLSX, peek at the content to detect layout and location column
-    layout       = 'separated'
-    has_location = False
-
-    try:
-        if ext == 'csv':
-            enc = detect_encoding(content_bytes)
-            df = pd.read_csv(io.BytesIO(content_bytes), encoding=enc,
-                             encoding_errors='replace', dtype=str, nrows=5)
-            # Check first column for non-numeric location strings
-            has_location = bool(re.search(r'[A-Za-z]', str(df.columns[0])) and
-                                'seq' not in str(df.columns[0]).lower())
-            # Check if qty values contain "/" (combined)
-            sample = df.to_string()
-            if re.search(r'\d+\.\d+\s+\w+/\d+\.\d+\s+\w+', sample):
-                layout = 'combined'
-
-        elif ext in ('xlsx', 'xls'):
-            df = pd.read_excel(io.BytesIO(content_bytes), header=None,
-                               dtype=str, nrows=8)
-            # XLSX: look for a classification column (col[0] has location names)
-            col0_vals = df.iloc[:, 0].dropna().tolist()
-            for v in col0_vals:
-                if isinstance(v, str) and len(v) > 3 and re.search(r'[A-Za-z]', v):
-                    has_location = True
-                    break
-            # Check layout from qty column values
-            flat = ' '.join(str(c) for c in df.values.flatten() if pd.notna(c))
-            if re.search(r'\d+\.\d+\s+\w+/\d+\.\d+\s+\w+', flat):
-                layout = 'combined'
-
-    except Exception:
-        pass
-
-    loc_str = 'all locations' if has_location else 'single location'
-    desc    = f"{ext.upper()} — {layout.capitalize()}, {loc_str}"
-    return {
-        'ext':          ext,
-        'layout':       layout,
-        'has_location': has_location,
-        'description':  desc,
+    REQUIRED_COLS = {
+        'seq', 'pack type', 'last inventory qty', 'inv count',
+        'item description', 'uom', 'price', 'total price',
     }
 
-# ── end of format detection ───────────────────────────────────────────────────
+    def parse(self, content: bytes, filename: str = '') -> ParseResult:
+        warnings   = []
+        math_errors = []
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  SEPARATED FORMAT — merge CS + EA row pairs into one CountRecord
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _uom_is_case(uom: str) -> bool:
-    return str(uom or '').strip().lower() in CASE_UOMS
-
-
-def _uom_is_each(uom: str) -> bool:
-    tok = str(uom or '').strip().lower()
-    return tok in EACH_UOMS or (tok not in CASE_UOMS and tok != '')
-
-
-def _merge_separated_df(df: pd.DataFrame, location: str = "Unspecified") -> List[CountRecord]:
-    """
-    Given a DataFrame with 2 rows per item (CS row + EA row),
-    group by (seq, description) and merge into one CountRecord per item.
-    """
-    records: List[CountRecord] = []
-
-    # Normalize column names
-    rename = {}
-    for col in df.columns:
-        key = str(col).strip().upper()
-        if key in COUNT_COL_MAP:
-            rename[col] = COUNT_COL_MAP[key]
-    df = df.rename(columns=rename)
-
-    required = {'description', 'uom'}
-    if not required.issubset(set(df.columns)):
-        return records
-
-    # Group rows by (seq, description)  — seq may be missing
-    group_cols = []
-    if 'seq' in df.columns:
-        group_cols.append('seq')
-    group_cols.append('description')
-
-    seen = {}  # key → partial CountRecord dict
-
-    for _, row in df.iterrows():
-        row = row.where(pd.notna(row), None)
-
-        desc = _scalar(row.get('description'))
-        if not desc or _is_skip_line(str(desc)):
-            continue
-
-        # Skip the grand-total sentinel row emitted by myOrders
-        # (the row where the location/classification cell reads "Total")
-        loc_cell = str(_scalar(row.get('location')) or '').strip().lower()
-        if loc_cell == 'total':
-            continue
-
-        seq       = str(_scalar(row.get('seq')) or '').strip()
-        pack_type = str(_scalar(row.get('pack_type')) or '').strip()
-        uom       = str(_scalar(row.get('uom')) or '').strip()
-        price     = _to_float(_scalar(row.get('price')))
-        qty_raw   = str(_scalar(row.get('last_qty')) or '0')
-        cnt_raw   = str(_scalar(row.get('inv_count')) or '0')
-        tot_price = _to_float(_scalar(row.get('total_price')))
-
-        # Extract numeric part of qty (e.g. "96.00 EA" → 96.0)
-        qty_num   = _to_float(re.sub(r'[^\d.]', '', qty_raw.split()[0]) if qty_raw.split() else '0')
-        cnt_num   = _to_float(re.sub(r'[^\d.]', '', cnt_raw.split()[0]) if cnt_raw.split() else '0')
-
-        group_key = f"{seq}||{str(desc).strip().upper()}"
-
-        if group_key not in seen:
-            seen[group_key] = {
-                'seq': seq, 'description': str(desc).strip(),
-                'pack_type': pack_type, 'location': location,
-                'last_qty_case': 0.0, 'last_qty_each': 0.0,
-                'count_qty_case': 0.0, 'count_qty_each': 0.0,
-                'price_case': 0.0, 'price_each': 0.0,
-                'total_price': 0.0,
-                'uom_case': 'CS', 'uom_each': 'EA',
-            }
-
-        entry = seen[group_key]
-        entry['total_price'] += tot_price
-
-        if _uom_is_case(uom):
-            entry['last_qty_case']  += qty_num   # accumulate across locations
-            entry['count_qty_case'] += cnt_num   # accumulate across locations
-            if price:
-                entry['price_case'] = price      # last non-zero price wins
-            entry['uom_case']       = uom.upper()
-            if not entry['pack_type'] and pack_type:
-                entry['pack_type'] = pack_type
-        elif _uom_is_each(uom):
-            entry['last_qty_each']  += qty_num   # accumulate across locations
-            entry['count_qty_each'] += cnt_num   # accumulate across locations
-            if price:
-                entry['price_each'] = price      # last non-zero price wins
-            entry['uom_each']       = uom.upper()
-
-    # Convert merged dicts to CountRecord objects
-    for data in seen.values():
-        key = _build_key(data['description'], data['pack_type'])
-        if not key:
-            continue
-        records.append(CountRecord(
-            location        = data['location'],
-            seq             = data['seq'],
-            item_description= data['description'],
-            pack_type       = data['pack_type'],
-            item_key        = key,
-            last_qty_case   = data['last_qty_case'],
-            last_qty_each   = data['last_qty_each'],
-            count_qty_case  = data['count_qty_case'],
-            count_qty_each  = data['count_qty_each'],
-            price_case      = data['price_case'],
-            price_each      = data['price_each'],
-            total_price     = data['total_price'],
-            uom_case        = data['uom_case'],
-            uom_each        = data['uom_each'],
-        ))
-
-    return records
-
-# ── end of separated format merge ────────────────────────────────────────────
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  COMBINED FORMAT — parse slash-delimited row into CountRecord
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _parse_combined_row(row_dict: Dict, location: str) -> Optional[CountRecord]:
-    """Convert a single combined-format row dict to a CountRecord."""
-    desc = str(row_dict.get('description') or '').strip()
-    if not desc or _is_skip_line(desc):
-        return None
-
-    seq       = str(row_dict.get('seq') or '').strip()
-    pack_type = str(row_dict.get('pack_type') or '').strip()
-
-    last_qc, last_uom_c, last_qe, last_uom_e = _parse_combined_qty(
-        row_dict.get('last_qty') or '0')
-    cnt_qc,  cnt_uom_c,  cnt_qe,  cnt_uom_e  = _parse_combined_qty(
-        row_dict.get('inv_count') or '0')
-    price_c, price_e = _parse_combined_price(row_dict.get('price') or '0')
-    tot_price        = _to_float(row_dict.get('total_price'))
-
-    key = _build_key(desc, pack_type)
-    if not key:
-        return None
-
-    return CountRecord(
-        location        = location,
-        seq             = seq,
-        item_description= desc,
-        pack_type       = pack_type,
-        item_key        = key,
-        last_qty_case   = last_qc,
-        last_qty_each   = last_qe,
-        count_qty_case  = cnt_qc,
-        count_qty_each  = cnt_qe,
-        price_case      = price_c,
-        price_each      = price_e,
-        total_price     = tot_price,
-        uom_case        = last_uom_c or cnt_uom_c or 'CS',
-        uom_each        = last_uom_e or cnt_uom_e or 'EA',
-    )
-
-# ── end of combined format ────────────────────────────────────────────────────
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  COUNT IMPORTER CLASS
-# ──────────────────────────────────────────────────────────────────────────────
-
-class CountImporter:
-
-    def __init__(self, database):
-        self.db     = database
-        self.errors: List[str] = []
-
-    # ──────────────────────────────────────────────────────────────────────────
-    #  PUBLIC — PARSE FILE
-    # ──────────────────────────────────────────────────────────────────────────
-
-    def parse(self, filename: str, content_bytes: bytes,
-              default_location: str = "Unspecified") -> Tuple[List[CountRecord], Dict]:
-        """
-        Main entry point. Detects format and returns:
-            (list of CountRecord, format_info dict)
-        self.errors is populated with any parse issues.
-        """
-        self.errors = []
-        fmt = detect_format(filename, content_bytes)
-        ext = fmt['ext']
-
+        # ── Load DataFrame ────────────────────────────────────────────────────
         try:
-            if ext == 'csv':
-                records = self._parse_csv(content_bytes, default_location)
-            elif ext in ('xlsx', 'xls'):
-                records = self._parse_xlsx(content_bytes)
-            elif ext == 'pdf':
-                records = self._parse_pdf(content_bytes)
-            else:
-                self.errors.append(f"Unsupported file type: {ext}")
-                return [], fmt
+            df = pd.read_csv(io.BytesIO(content), dtype=str, keep_default_na=False)
         except Exception as e:
-            self.errors.append(f"Parse error: {e}")
-            return [], fmt
+            return ParseResult([], 0, 0, 0, 0, [f"CSV read error: {e}"], [])
 
-        fmt['record_count'] = len(records)
-        fmt['locations']    = sorted(set(r.location for r in records))
-        return records, fmt
+        # Normalize column names
+        df.columns = [c.strip().lower() for c in df.columns]
 
-    # ── end of public parse ───────────────────────────────────────────────────
+        missing = self.REQUIRED_COLS - set(df.columns)
+        if missing:
+            return ParseResult([], 0, 0, 0, 0,
+                               [f"Missing columns: {', '.join(sorted(missing))}"], [])
 
-
-    # ──────────────────────────────────────────────────────────────────────────
-    #  CSV PARSER  —  Separated, single location, sorted by Seq
-    # ──────────────────────────────────────────────────────────────────────────
-
-    def _parse_csv(self, content_bytes: bytes,
-                   default_location: str = "Unspecified") -> List[CountRecord]:
-        """
-        myOrders CSV exports have several metadata rows at the top before the
-        real column header row.  We read with header=None, scan for the first
-        row that contains the known column names, then slice from there —
-        exactly the same strategy as _parse_xlsx.
-        """
-        enc = detect_encoding(content_bytes)
-        raw = pd.read_csv(
-            io.BytesIO(content_bytes),
-            encoding=enc,
-            encoding_errors='replace',
-            dtype=str,
-            header=None,
-        )
-        raw = raw.where(pd.notna(raw), None)
-
-        # ── Find the real header row ─────────────────────────────────────────
-        header_row = 0
-        known_headers = {k.upper() for k in COUNT_COL_MAP}
-        for i, row in raw.iterrows():
-            vals = {str(v).strip().upper() for v in row if v}
-            if vals & known_headers:   # at least one known column name found
-                header_row = i
-                break
-
-        # ── Slice: header row → columns, everything below → data ────────────
-        df = raw.iloc[header_row + 1:].copy()
-        df.columns = [str(v).strip() if v else f"col_{i}"
-                      for i, v in enumerate(raw.iloc[header_row])]
         df = df.reset_index(drop=True)
-        df = df.where(pd.notna(df), None)
+        total_rows = len(df)
 
-        return _merge_separated_df(df, location=default_location)
+        # ── Group raw rows into (seq, description) pairs ──────────────────────
+        # Each item appears exactly twice: case row then each row (same seq + desc)
+        groups: Dict[Tuple[str,str,str], List[dict]] = {}
+        order:  List[Tuple[str,str,str]] = []
+        skipped = 0
+        row_index = 0   # tracks position for state machine
 
-    # ── end of CSV parser ─────────────────────────────────────────────────────
+        raw_items = []  # list of (row_index_of_case_row, case_row_dict, each_row_dict)
 
+        i = 0
+        rows = df.to_dict('records')
+        while i < len(rows):
+            r = rows[i]
+            seq  = str(r.get('seq', '')).strip()
+            desc = str(r.get('item description', '')).strip()
+            uom  = str(r.get('uom', '')).strip()
 
-    # ──────────────────────────────────────────────────────────────────────────
-    #  XLSX PARSER  —  Separated, all locations, col[0] = Classification
-    # ──────────────────────────────────────────────────────────────────────────
-
-    def _parse_xlsx(self, content_bytes: bytes) -> List[CountRecord]:
-        """
-        The XLSX from myOrders has a header block (rows 0-3) then:
-          Row 4:  'Grouped by: Classification' | 'Seq' | 'Pack Type' | ... (actual headers)
-          Row 5+: data rows where col[0] = location name
-        """
-        raw = pd.read_excel(io.BytesIO(content_bytes), header=None, dtype=str)
-        raw = raw.where(pd.notna(raw), None)
-
-        # Find the header row (contains 'Seq' or 'Pack Type')
-        header_row = 4  # default for known format
-        for i, row in raw.iterrows():
-            vals = [str(v).strip().lower() for v in row if v]
-            if 'seq' in vals or 'pack type' in vals:
-                header_row = i
-                break
-
-        df = raw.iloc[header_row + 1:].copy()
-        df.columns = [str(v).strip() if v else f"col_{i}"
-                      for i, v in enumerate(raw.iloc[header_row])]
-        df = df.reset_index(drop=True)
-        df = df.where(pd.notna(df), None)
-
-        # The first column is the location / classification
-        # Rename it and then split by location
-        first_col = df.columns[0]
-        df = df.rename(columns={first_col: 'location'})
-
-        # Non-Chargeable rows: filter or tag them
-        # (We keep them but mark is_chargeable=False)
-        records: List[CountRecord] = []
-        locations = df['location'].dropna().unique()
-
-        for loc in locations:
-            loc_str = str(loc).strip()
-            if not loc_str:
+            if not seq or not desc:
+                skipped += 1
+                i += 1
                 continue
 
-            # Determine chargeability from location name
-            is_chargeable = 'non-chargeable' not in loc_str.lower()
+            # Peek at next row
+            if i + 1 < len(rows):
+                r2   = rows[i + 1]
+                seq2 = str(r2.get('seq', '')).strip()
+                desc2 = str(r2.get('item description', '')).strip()
 
-            loc_df = df[df['location'] == loc].copy()
-            loc_df = loc_df.drop(columns=['location'])
-
-            loc_records = _merge_separated_df(loc_df, location=loc_str)
-            for r in loc_records:
-                r.is_chargeable = is_chargeable
-            records.extend(loc_records)
-
-        return records
-
-    # ── end of XLSX parser ────────────────────────────────────────────────────
-
-
-    # ──────────────────────────────────────────────────────────────────────────
-    #  PDF PARSER  —  Combined slash-delimited, section headers = locations
-    # ──────────────────────────────────────────────────────────────────────────
-
-    def _parse_pdf(self, content_bytes: bytes) -> List[CountRecord]:
-        """
-        Uses pdfplumber to extract tables from the count PDF.
-        Section headers (non-table text) become location context.
-        Qty/Price cells contain slash-delimited combined values.
-        """
-        try:
-            import pdfplumber
-        except ImportError:
-            self.errors.append("pdfplumber not installed — PDF parsing unavailable.")
-            return []
-
-        records: List[CountRecord] = []
-        current_location = "Unspecified"
-
-        # Column name regex for detecting the header row within a table
-        header_pattern = re.compile(
-            r'(seq|pack type|last inventory|inv count|item description)',
-            re.IGNORECASE
-        )
-
-        with pdfplumber.open(io.BytesIO(content_bytes)) as pdf:
-            for page in pdf.pages:
-                # ── Extract text lines for section header detection ──────────
-                text_lines = (page.extract_text() or '').split('\n')
-
-                # ── Extract tables ───────────────────────────────────────────
-                tables = page.extract_tables()
-
-                for table in tables:
-                    if not table or len(table) < 2:
-                        continue
-
-                    # Find the header row within this table
-                    col_headers = None
-                    data_start  = 0
-                    for i, row in enumerate(table):
-                        row_text = ' '.join(str(c or '') for c in row)
-                        if header_pattern.search(row_text):
-                            col_headers = [str(c or '').strip().upper() for c in row]
-                            data_start  = i + 1
-                            break
-
-                    if col_headers is None:
-                        # Try to infer headers from position (fallback)
-                        continue
-
-                    # Map header positions
-                    col_idx = {}
-                    for ci, h in enumerate(col_headers):
-                        mapped = COUNT_COL_MAP.get(h)
-                        if mapped:
-                            col_idx[mapped] = ci
-                        # Also check partial matches
-                        elif 'LAST INVENTORY' in h:
-                            col_idx['last_qty'] = ci
-                        elif 'INV COUNT' in h:
-                            col_idx['inv_count'] = ci
-                        elif 'ITEM DESCRIPTION' in h:
-                            col_idx['description'] = ci
-                        elif h == 'SEQ':
-                            col_idx['seq'] = ci
-                        elif 'PACK TYPE' in h:
-                            col_idx['pack_type'] = ci
-                        elif h == 'UOM':
-                            col_idx['uom'] = ci
-                        elif h == 'PRICE':
-                            col_idx['price'] = ci
-                        elif 'TOTAL PRICE' in h:
-                            col_idx['total_price'] = ci
-
-                    def _cell(row, field):
-                        idx = col_idx.get(field)
-                        if idx is None or idx >= len(row):
-                            return None
-                        return str(row[idx] or '').strip()
-
-                    for row in table[data_start:]:
-                        if not row or all(not c for c in row):
-                            continue
-
-                        # Check if this is a section-header row (location change)
-                        row_text = ' '.join(str(c or '') for c in row).strip()
-                        if _is_section_header(row_text, col_idx):
-                            # Extract location name from first non-empty cell
-                            for cell in row:
-                                if cell and str(cell).strip():
-                                    loc_candidate = str(cell).strip()
-                                    if not _is_skip_line(loc_candidate):
-                                        current_location = loc_candidate
-                                    break
-                            continue
-
-                        row_dict = {
-                            'seq':         _cell(row, 'seq'),
-                            'pack_type':   _cell(row, 'pack_type'),
-                            'last_qty':    _cell(row, 'last_qty'),
-                            'inv_count':   _cell(row, 'inv_count'),
-                            'description': _cell(row, 'description'),
-                            'uom':         _cell(row, 'uom'),
-                            'price':       _cell(row, 'price'),
-                            'total_price': _cell(row, 'total_price'),
-                        }
-
-                        rec = _parse_combined_row(row_dict, current_location)
-                        if rec:
-                            records.append(rec)
-
-                # ── Scan text lines for location headers not inside tables ───
-                for line in text_lines:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    # Location headers are lines like "Track Market" or
-                    # "Ferttita->Stand 101" that aren't data rows
-                    if _is_location_line(line):
-                        current_location = line
-
-        return records
-
-    # ── end of PDF parser ─────────────────────────────────────────────────────
-
-
-    # ──────────────────────────────────────────────────────────────────────────
-    #  VARIANCE CALCULATION  —  compare records vs. database, NO writes
-    #  One bulk DB query replaces the previous per-item query loop.
-    # ──────────────────────────────────────────────────────────────────────────
-
-    def calculate_variance(
-        self,
-        records:              List[CountRecord],
-        flag_each_threshold:  int   = DEFAULT_FLAG_EACH,
-        flag_value_threshold: float = DEFAULT_FLAG_VALUE,
-    ) -> List[VarianceRecord]:
-        """
-        Diff every CountRecord against the current DB qty.
-        Fetches ALL required items in a single query, then diffs in memory.
-        Returns a list of VarianceRecord objects — no DB writes.
-        """
-        if not records:
-            return []
-
-        # ── Single bulk fetch ────────────────────────────────────────────────
-        all_keys    = list({r.item_key for r in records})
-        db_map      = self.db.get_items_bulk(all_keys)        # {key: item_dict}
-        
-        # Fetch count overrides (may not exist on first run before table creation)
-        try:
-            override_map = self.db.get_count_overrides_bulk(all_keys)  # {key: override_dict}
-        except (AttributeError, Exception) as e:
-            # Table doesn't exist yet or method not found — proceed without overrides
-            print(f"Count overrides not available (expected on first run): {e}")
-            override_map = {}
-
-        # ── In-memory diff ───────────────────────────────────────────────────
-        variance_list: List[VarianceRecord] = []
-
-        for rec in records:
-            db_item     = db_map.get(rec.item_key)
-            in_db       = db_item is not None
-            db_qty      = float(db_item.get("quantity_on_hand") or 0) if in_db else 0.0
-            db_price_ea = float(db_item.get("cost") or 0)             if in_db else rec.price_each
-
-            # ── Check for MOG / bad-ratio override first ─────────────────────
-            #  Override rules live in count_overrides table and are managed via
-            #  the Override & Rule Manager page.  When active, the override
-            #  divisor replaces normal conv logic entirely.
-            #
-            #  case_behavior options:
-            #    'ignore' — only use each qty ÷ divisor  (default for MOG items)
-            #    'add'    — (each ÷ divisor) + (case × conv)
-            override = override_map.get(rec.item_key)
-            if override:
-                divisor       = float(override.get("divisor") or 1.0)
-                case_behavior = override.get("case_behavior", "ignore")
-                divisor       = divisor if divisor > 0 else 1.0
-                overridden_each = rec.count_qty_each / divisor
-                if case_behavior == "add":
-                    # still need a conv for the case portion
-                    pt_m = re.match(r'^(\d+)/', str(rec.pack_type or '').strip())
-                    case_conv = float(pt_m.group(1)) if pt_m else 1.0
-                    new_qty = overridden_each + (rec.count_qty_case * case_conv)
-                else:
-                    new_qty = overridden_each
-            else:
-                # ── Resolve conv_ratio ───────────────────────────────────────
-                #  Priority:
-                #    1. DB conv_ratio if explicitly set (> 1) — manual override wins
-                #    2. Leading integer in pack_type string  ("12/24oz CAN" → 12)
-                #    3. Default = 1  — never silently drops case qty
-                #
-                #  NOTE: conv_ratio = 1 in DB is treated as "not set" because the
-                #  schema default is 1, making it indistinguishable from an explicit
-                #  entry.  Pack_type extraction is the authoritative source for all
-                #  standard N/unit formats.
-                conv = None
-
-                if in_db:
-                    try:
-                        db_conv = float(db_item.get("conv_ratio") or 0)
-                        if db_conv > 1:   # > 1, not > 0 — skip schema default of 1
-                            conv = db_conv
-                    except (ValueError, TypeError):
-                        pass
-
-                if conv is None:
-                    pt_match = re.match(r'^(\d+)/', str(rec.pack_type or '').strip())
-                    if pt_match:
-                        extracted = int(pt_match.group(1))
-                        if extracted > 0:
-                            conv = float(extracted)
-
-                if conv is None:
-                    conv = 1.0   # absolute fallback — never drop case qty
-
-                new_qty = rec.count_qty_each + (rec.count_qty_case * conv)
-
-            variance_each   = new_qty - db_qty
-            eff_price       = rec.price_each if rec.price_each > 0 else db_price_ea
-            variance_value  = variance_each * eff_price
-
-            is_flagged  = False
-            flag_reason = ""
-            if not in_db:
-                is_flagged  = True
-                flag_reason = "Item not found in database"
-            elif abs(variance_each) > flag_each_threshold:
-                is_flagged  = True
-                flag_reason = f"Unit variance {variance_each:+.1f} exceeds threshold {flag_each_threshold}"
-            elif abs(variance_value) > flag_value_threshold:
-                is_flagged  = True
-                flag_reason = f"Value variance ${variance_value:+.2f} exceeds threshold ${flag_value_threshold:.2f}"
-
-            variance_list.append(VarianceRecord(
-                record          = rec,
-                db_qty          = db_qty,
-                db_price_each   = db_price_ea,
-                new_qty         = new_qty,
-                variance_each   = variance_each,
-                variance_value  = variance_value,
-                in_db           = in_db,
-                is_flagged      = is_flagged,
-                flag_reason     = flag_reason,
-            ))
-
-        return variance_list
-
-    # ── end of variance calculation ───────────────────────────────────────────
-
-
-    # ──────────────────────────────────────────────────────────────────────────
-    #  EXECUTE IMPORT  —  write qty updates + variance log to DB
-    # ──────────────────────────────────────────────────────────────────────────
-
-    def execute_count_import(
-        self,
-        variance_records: List[VarianceRecord],
-        meta:             CountImportMeta,
-        add_missing:      bool = False,
-    ) -> Dict:
-        """
-        Writes the count to the database:
-        1. Optionally creates new items for records not currently in DB
-        2. Updates quantity_on_hand for each matched item
-        3. Logs the import in count_imports
-        4. Saves all variance detail rows in count_variance_detail
-
-        add_missing=True:  items not found in DB are created from CountRecord
-                           data (description, pack_type, cost, location, etc.)
-                           and then their qty is set from the count.
-        add_missing=False: items not in DB are skipped (original behavior).
-
-        Returns a summary dict.
-        """
-        results = {
-            'import_id':        meta.import_id,
-            'items_created':    0,
-            'items_updated':    0,
-            'items_skipped':    0,
-            'items_flagged':    0,
-            'errors':           [],
-            'total_prev_value': 0.0,
-            'total_new_value':  0.0,
-            'total_variance_value': 0.0,
-        }
-
-        # ── Pre-compute value totals ─────────────────────────────────────────
-        for vr in variance_records:
-            rec = vr.record
-            results['total_prev_value']    += vr.db_qty * (
-                vr.db_price_each if vr.db_price_each else rec.price_each)
-            results['total_new_value']     += rec.total_price   # authoritative export value
-            results['total_variance_value'] += vr.variance_value
-            if vr.is_flagged:
-                results['items_flagged'] += 1
-
-        # ── Pass 1: create missing items if requested ────────────────────────
-        if add_missing:
-            missing = [vr for vr in variance_records if not vr.in_db]
-            for vr in missing:
-                rec = vr.record
-                new_item = {
-                    'key':              rec.item_key,
-                    'description':      rec.item_description.strip().upper(),
-                    'pack_type':        rec.pack_type,
-                    'cost':             rec.price_each or rec.price_case or 0.0,
-                    'quantity_on_hand': vr.new_qty,
-                    'is_chargeable':    rec.is_chargeable,
-                    'cost_center':      meta.cost_center,
-                    'status_tag':       '📦 From Count',
-                    'user_notes':       (
-                        f"Created from count import {meta.import_id} "
-                        f"· location: {rec.location} · {meta.count_date}"
-                    ),
-                }
-                try:
-                    ok = self.db.add_item(new_item, changed_by=meta.imported_by)
-                    if ok:
-                        results['items_created'] += 1
-                        # Mark as now in_db so Pass 2 can update qty
-                        vr.in_db = True
+                if seq2 == seq and desc2 == desc:
+                    # Pair found — determine which is case and which is each
+                    uom2 = str(r2.get('uom', '')).strip()
+                    if _is_case_uom(uom):
+                        case_row, each_row = r, r2
+                    elif _is_case_uom(uom2):
+                        case_row, each_row = r2, r
                     else:
-                        results['errors'].append(
-                            f"Could not create {rec.item_key} (may already exist)")
-                        results['items_skipped'] += 1
-                except Exception as e:
-                    results['errors'].append(f"Create {rec.item_key}: {e}")
-                    results['items_skipped'] += 1
+                        # Neither is clearly a case — treat first as case
+                        case_row, each_row = r, r2
+                        warnings.append(
+                            f"Seq {seq} '{desc}': neither UOM looks like a case "
+                            f"('{uom}' / '{uom2}') — assuming first row is case"
+                        )
+                    raw_items.append((i, case_row, each_row))
+                    i += 2
+                    continue
 
-        # ── Pass 2: update qty for all in-DB items ───────────────────────────
-        for vr in variance_records:
-            rec = vr.record
-            if not vr.in_db:
-                results['items_skipped'] += 1
-                continue
+            # Orphan row — single entry, no pair
+            warnings.append(f"Seq {seq} '{desc}': orphan row (no matching pair) — skipped")
+            skipped += 1
+            i += 1
+
+        # ── State machine — classify sections and assign locations ─────────────
+        #
+        # State: current classification within a location
+        # Transitions on seq reset (seq resets to a value ≤ prev seq):
+        #   CHARGEABLE     → NON-CHARGEABLE  (same location)
+        #   NON-CHARGEABLE → LIQUOR          (same location, if next section = LIQUOR)
+        #   NON-CHARGEABLE → CHARGEABLE      (NEW LOCATION)
+        #   LIQUOR         → anything        (NEW LOCATION)
+
+        records      = []
+        location_num = 1
+        section_count = 0
+        current_section = 'CHARGEABLE'
+        prev_seq_num    = -1
+        section_first_desc = None
+        section_decided = False
+
+        for idx, (row_idx, case_row, each_row) in enumerate(raw_items):
+            seq_str  = str(case_row.get('seq', '')).strip()
+            desc     = str(case_row.get('item description', '')).strip()
+            pack     = str(case_row.get('pack type', '')).strip()
+
             try:
-                ok = self.db.update_quantity_from_count(
-                    key        = rec.item_key,
-                    new_qty    = vr.new_qty,
-                    import_id  = meta.import_id,
-                    changed_by = meta.imported_by,
+                seq_num = int(float(seq_str))
+            except ValueError:
+                seq_num = 0
+
+            # ── Detect seq reset ───────────────────────────────────────────
+            is_reset = (seq_num <= prev_seq_num) and (prev_seq_num > 0)
+
+            if is_reset:
+                # Determine what the next section is by looking at this item
+                next_class = _classify(desc)
+                section_count += 1
+
+                if current_section == 'CHARGEABLE':
+                    if next_class == 'NON-CHARGEABLE':
+                        current_section = 'NON-CHARGEABLE'   # same location
+                    else:
+                        location_num   += 1                   # new location
+                        current_section = 'CHARGEABLE'
+
+                elif current_section == 'NON-CHARGEABLE':
+                    if next_class == 'LIQUOR':
+                        current_section = 'LIQUOR'            # same location
+                    else:
+                        location_num   += 1                   # new location
+                        current_section = 'CHARGEABLE'
+
+                elif current_section == 'LIQUOR':
+                    location_num   += 1                       # always new location
+                    current_section = 'CHARGEABLE'
+
+                section_first_desc = desc
+                section_decided    = True
+            else:
+                if prev_seq_num < 0:
+                    # Very first item
+                    current_section    = _classify(desc)
+                    section_first_desc = desc
+                    section_count      = 1
+
+            prev_seq_num = seq_num
+
+            # ── Parse values ───────────────────────────────────────────────
+            case_uom  = _normalize_uom(str(case_row.get('uom', '')))
+            each_uom  = _normalize_uom(str(each_row.get('uom', '')))
+
+            last_case = _clean_qty(case_row.get('last inventory qty'))
+            cnt_case  = _clean_qty(case_row.get('inv count'))
+            pr_case   = _clean_price(case_row.get('price'))
+            tot_case  = _clean_price(case_row.get('total price'))
+
+            last_each = _clean_qty(each_row.get('last inventory qty'))
+            cnt_each  = _clean_qty(each_row.get('inv count'))
+            pr_each   = _clean_price(each_row.get('price'))
+            tot_each  = _clean_price(each_row.get('total price'))
+
+            # ── Math verification ──────────────────────────────────────────
+            label = f"Loc{location_num} Seq{seq_str} '{desc}'"
+            cnt_case_v, case_ok, case_warn = _verify_math(
+                cnt_case, pr_case, tot_case, f"{label} CASE"
+            )
+            cnt_each_v, each_ok, each_warn = _verify_math(
+                cnt_each, pr_each, tot_each, f"{label} EACH"
+            )
+            if case_warn: math_errors.append(case_warn)
+            if each_warn: math_errors.append(each_warn)
+
+            total_price = round(tot_case + tot_each, 2)
+
+            record = CountRecord(
+                seq              = seq_str,
+                item_description = desc,
+                pack_type        = pack,
+                item_key         = _build_key(desc, pack),
+                case_uom         = case_uom,
+                last_qty_case    = last_case,
+                count_qty_case   = cnt_case_v,
+                price_case       = pr_case,
+                each_uom         = each_uom,
+                last_qty_each    = last_each,
+                count_qty_each   = cnt_each_v,
+                price_each       = pr_each,
+                total_price_case = tot_case,
+                total_price_each = tot_each,
+                location_num     = location_num,
+                classification   = current_section,
+                is_chargeable    = (current_section != 'NON-CHARGEABLE'),
+                total_price      = total_price,
+                verified         = case_ok and each_ok,
+            )
+            records.append(record)
+
+        return ParseResult(
+            records        = records,
+            location_count = location_num,
+            section_count  = section_count,
+            row_count      = total_rows,
+            skipped_rows   = skipped,
+            warnings       = warnings,
+            math_errors    = math_errors,
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  AGGREGATOR
+#  Collapses duplicate item keys across locations into per-item totals
+#  and per-location breakdowns.
+# ──────────────────────────────────────────────────────────────────────────────
+
+def aggregate(records: List[CountRecord]) -> Dict:
+    """
+    Returns:
+      by_key:      {item_key: {total_each, total_case, total_value, locations: [...]}}
+      by_location: {location_num: [CountRecord]}
+      summary:     {location_num: {chargeable_value, non_chargeable_value, liquor_value, total}}
+    """
+    by_key: Dict[str, dict] = {}
+    by_location: Dict[int, List[CountRecord]] = {}
+    summary: Dict[int, dict] = {}
+
+    for r in records:
+        # by_key
+        if r.item_key not in by_key:
+            by_key[r.item_key] = {
+                'item_description': r.item_description,
+                'pack_type':        r.pack_type,
+                'price_each':       r.price_each,
+                'price_case':       r.price_case,
+                'total_each':       0.0,
+                'total_case':       0.0,
+                'total_value':      0.0,
+                'locations':        [],
+            }
+        entry = by_key[r.item_key]
+        entry['total_each']  += r.count_qty_each
+        entry['total_case']  += r.count_qty_case
+        entry['total_value'] += r.total_price
+        entry['locations'].append(r.location_num)
+
+        # by_location
+        by_location.setdefault(r.location_num, []).append(r)
+
+        # summary
+        if r.location_num not in summary:
+            summary[r.location_num] = {
+                'chargeable_value':     0.0,
+                'non_chargeable_value': 0.0,
+                'liquor_value':         0.0,
+                'total':                0.0,
+            }
+        s = summary[r.location_num]
+        s['total'] += r.total_price
+        if r.classification == 'CHARGEABLE':
+            s['chargeable_value'] += r.total_price
+        elif r.classification == 'NON-CHARGEABLE':
+            s['non_chargeable_value'] += r.total_price
+        elif r.classification == 'LIQUOR':
+            s['liquor_value'] += r.total_price
+
+    return {
+        'by_key':       by_key,
+        'by_location':  by_location,
+        'summary':      summary,
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  DB WRITER
+# ──────────────────────────────────────────────────────────────────────────────
+
+def commit_count(
+    records:    List[CountRecord],
+    db,
+    count_date: str,
+    imported_by: str,
+    count_type:  str = 'complete',
+    cost_center: str = 'default',
+) -> Dict:
+    """
+    Write count records to the database.
+    Returns result summary dict.
+    """
+    import_id = f"CNT-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6].upper()}"
+
+    results = {
+        'import_id':     import_id,
+        'items_updated': 0,
+        'items_created': 0,
+        'items_skipped': 0,
+        'errors':        [],
+        'total_value':   0.0,
+    }
+
+    variance_rows = []
+
+    for r in records:
+        try:
+            db_item = db.get_item(r.item_key)
+            prev_qty = float(db_item['quantity_on_hand']) if db_item else 0.0
+            new_qty  = r.count_qty_each  # canonical qty stored as each units
+
+            if db_item:
+                ok = db.update_quantity_from_count(
+                    r.item_key, new_qty, import_id, changed_by=imported_by
                 )
                 if ok:
                     results['items_updated'] += 1
                 else:
+                    results['errors'].append(f"Update failed: {r.item_key}")
                     results['items_skipped'] += 1
-            except Exception as e:
-                results['errors'].append(f"{rec.item_key}: {e}")
-                results['items_skipped'] += 1
+            else:
+                # Create minimal record from count data
+                new_item = {
+                    'key':               r.item_key,
+                    'description':       r.item_description,
+                    'pack_type':         r.pack_type,
+                    'cost':              r.price_each,
+                    'quantity_on_hand':  new_qty,
+                    'is_chargeable':     r.is_chargeable,
+                    'cost_center':       cost_center,
+                    'status_tag':        '📦 Count Import',
+                }
+                db.add_item(new_item, changed_by=imported_by)
+                results['items_created'] += 1
 
-        # ── Pass 3: save import metadata ────────────────────────────────────
-        try:
-            self.db.log_count_import(
-                import_id        = meta.import_id,
-                source_file      = meta.source_file,
-                file_format      = meta.file_format,
-                data_layout      = meta.data_layout,
-                count_type       = meta.count_type,
-                count_date       = meta.count_date,
-                cost_center      = meta.cost_center,
-                imported_by      = meta.imported_by,
-                total_items      = len(variance_records),
-                items_changed    = results['items_updated'],
-                items_flagged    = results['items_flagged'],
-                total_prev_value = results['total_prev_value'],
-                total_new_value  = results['total_new_value'],
-                variance_value   = results['total_variance_value'],
-            )
+            results['total_value'] += r.total_price
+
+            # Variance detail row
+            variance_rows.append({
+                'import_id':        import_id,
+                'location':         f"Location {r.location_num}",
+                'seq':              r.seq,
+                'item_key':         r.item_key,
+                'item_description': r.item_description,
+                'pack_type':        r.pack_type,
+                'prev_qty_each':    prev_qty,
+                'new_qty_each':     new_qty,
+                'count_qty_case':   r.count_qty_case,
+                'count_qty_each':   r.count_qty_each,
+                'price_each':       r.price_each,
+                'variance_each':    new_qty - prev_qty,
+                'variance_value':   round((new_qty - prev_qty) * r.price_each, 2),
+                'is_flagged':       False,
+                'flag_reason':      '',
+            })
+
         except Exception as e:
-            results['errors'].append(f"Import log write failed: {e}")
+            results['errors'].append(f"{r.item_key}: {e}")
+            results['items_skipped'] += 1
 
-        # ── Pass 4: save variance detail ─────────────────────────────────────
+    # Bulk write variance detail
+    if variance_rows:
         try:
-            detail_rows = []
-            for vr in variance_records:
-                rec = vr.record
-                detail_rows.append({
-                    'import_id':        meta.import_id,
-                    'location':         rec.location,
-                    'seq':              rec.seq,
-                    'item_key':         rec.item_key,
-                    'item_description': rec.item_description,
-                    'pack_type':        rec.pack_type,
-                    'prev_qty_each':    vr.db_qty,
-                    'new_qty_each':     vr.new_qty,
-                    'count_qty_case':   rec.count_qty_case,
-                    'count_qty_each':   rec.count_qty_each,
-                    'price_each':       rec.price_each,
-                    'variance_each':    vr.variance_each,
-                    'variance_value':   vr.variance_value,
-                    'is_flagged':       vr.is_flagged,
-                    'flag_reason':      vr.flag_reason,
-                })
-            self.db.save_count_variance_records(detail_rows)
+            db.save_count_variance_records(variance_rows)
         except Exception as e:
             results['errors'].append(f"Variance detail write failed: {e}")
 
-        return results
+    # Log the import
+    try:
+        db.log_count_import(
+            import_id        = import_id,
+            source_file      = '',
+            file_format      = 'csv',
+            data_layout      = 'export24',
+            count_type       = count_type,
+            count_date       = count_date,
+            cost_center      = cost_center,
+            imported_by      = imported_by,
+            total_items      = len(records),
+            items_changed    = results['items_updated'] + results['items_created'],
+            items_flagged    = 0,
+            total_prev_value = 0.0,
+            total_new_value  = results['total_value'],
+            variance_value   = results['total_value'],
+        )
+    except Exception as e:
+        results['errors'].append(f"Import log failed: {e}")
 
-    # ── end of execute import ─────────────────────────────────────────────────
-
-# ── end of CountImporter class ────────────────────────────────────────────────
+    return results
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  PDF HELPER FUNCTIONS  (module-level so they're accessible inside the parser)
+#  STREAMLIT PAGE  (called from app.py)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _is_section_header(row_text: str, col_idx: Dict) -> bool:
-    """
-    Returns True if this table row looks like a section header
-    (location name row) rather than a data row.
-    A header row typically: has a description field that contains an
-    arrow pattern like "Ferttita->Stand 101" or is just one non-numeric cell.
-    """
-    text = row_text.strip()
-    if not text:
-        return False
-    # Location names often contain "->" separators
-    if '->' in text:
-        return True
-    # Section header rows have very few columns populated
-    non_empty = [c for c in text.split() if c]
-    # If it looks like a plain label with no numbers, likely a header
-    has_digits = bool(re.search(r'\d', text))
-    if not has_digits and len(non_empty) <= 6:
-        return True
-    return False
+def render_count_import_page(db, get_changed_by_fn):
+    import streamlit as st
 
+    st.title("📋 Count Import")
+    st.caption("Upload a PAC / myOrders count sheet CSV.")
 
-def _is_location_line(line: str) -> bool:
-    """
-    Returns True if a text line (outside a table) looks like a location header.
-    Examples: "Track Market", "Ferttita->Stand 101", "TDECU - Concessions->Cooler"
-    """
-    line = line.strip()
-    if not line or len(line) < 3:
-        return False
-    if _is_skip_line(line):
-        return False
-    # Location names don't start with digits
-    if line[0].isdigit():
-        return False
-    # Location names don't contain $ signs
-    if '$' in line:
-        return False
-    # Arrow separator is a strong indicator
-    if '->' in line or '→' in line:
-        return True
-    # Known top-level sections
-    known = ('track market', 'ferttita', 'tdecu', 'concessions',
-             'softball', 'uha schroeder', 'liquor room', 'warehouse',
-             'cooler', 'popcorn room', 'vending')
-    low = line.lower()
-    if any(k in low for k in known):
-        return True
-    return False
+    # ── Upload ────────────────────────────────────────────────────────────────
+    uploaded = st.file_uploader(
+        "Drop count sheet CSV here",
+        type=["csv"],
+        label_visibility="collapsed",
+    )
+    if not uploaded:
+        return
 
-# ── end of PDF helper functions ───────────────────────────────────────────────
+    content = uploaded.read()
+
+    # ── Parse ─────────────────────────────────────────────────────────────────
+    parser = CountSheetParser()
+    with st.spinner("Parsing..."):
+        result = parser.parse(content, uploaded.name)
+
+    if not result.records:
+        for w in result.warnings:
+            st.error(w)
+        return
+
+    # ── Parse summary ─────────────────────────────────────────────────────────
+    st.success(
+        f"✅ Parsed **{len(result.records)}** items across "
+        f"**{result.location_count}** location(s) "
+        f"({result.skipped_rows} rows skipped)"
+    )
+
+    if result.warnings:
+        with st.expander(f"⚠️ {len(result.warnings)} warning(s)"):
+            for w in result.warnings:
+                st.caption(w)
+
+    if result.math_errors:
+        with st.expander(f"🔢 {len(result.math_errors)} math correction(s)"):
+            for e in result.math_errors:
+                st.caption(e)
+
+    # ── Aggregation & preview ─────────────────────────────────────────────────
+    agg = aggregate(result.records)
+
+    st.markdown("---")
+    st.subheader("📍 Location Summary")
+
+    summary_rows = []
+    for loc_num, s in sorted(agg['summary'].items()):
+        summary_rows.append({
+            'Location':        f"Location {loc_num}",
+            'Items':           len(agg['by_location'][loc_num]),
+            'Chargeable $':    f"${s['chargeable_value']:,.2f}",
+            'Non-Chargeable $':f"${s['non_chargeable_value']:,.2f}",
+            'Liquor $':        f"${s['liquor_value']:,.2f}",
+            'Total $':         f"${s['total']:,.2f}",
+        })
+    st.dataframe(
+        __import__('pandas').DataFrame(summary_rows),
+        use_container_width=True, hide_index=True
+    )
+
+    # Grand total
+    grand_total = sum(s['total'] for s in agg['summary'].values())
+    st.metric("Grand Total Inventory Value", f"${grand_total:,.2f}")
+
+    # ── Per-location drill-down ───────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("🔍 Item Detail")
+
+    loc_options = [f"Location {n}" for n in sorted(agg['by_location'].keys())]
+    selected_loc = st.selectbox("View location", ["All"] + loc_options)
+
+    if selected_loc == "All":
+        view_records = result.records
+    else:
+        loc_num = int(selected_loc.split()[-1])
+        view_records = agg['by_location'][loc_num]
+
+    class_filter = st.multiselect(
+        "Filter by classification",
+        ["CHARGEABLE", "NON-CHARGEABLE", "LIQUOR"],
+        default=["CHARGEABLE", "NON-CHARGEABLE", "LIQUOR"],
+    )
+    view_records = [r for r in view_records if r.classification in class_filter]
+
+    import pandas as pd
+    detail_df = pd.DataFrame([{
+        'Loc':          r.location_num,
+        'Seq':          r.seq,
+        'Description':  r.item_description,
+        'Pack Type':    r.pack_type,
+        'Class':        r.classification,
+        'Last Case':    r.last_qty_case,
+        'Count Case':   r.count_qty_case,
+        'Case Price':   f"${r.price_case:.2f}",
+        'Last Each':    r.last_qty_each,
+        'Count Each':   r.count_qty_each,
+        'Each Price':   f"${r.price_each:.2f}",
+        'Total $':      f"${r.total_price:.2f}",
+        '✓':            '✅' if r.verified else '⚠️',
+    } for r in view_records])
+
+    st.caption(f"{len(detail_df)} items")
+    st.dataframe(detail_df, use_container_width=True, hide_index=True)
+
+    # ── Commit ────────────────────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("✅ Commit Count")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        count_date = st.date_input("Count date", value=__import__('datetime').date.today())
+    with col2:
+        count_type = st.radio("Count type", ["complete", "partial"], horizontal=True)
+
+    confirmed = st.checkbox(
+        f"Commit {len(result.records)} items from {result.location_count} location(s) "
+        f"— total value ${grand_total:,.2f}"
+    )
+
+    if st.button("✅ Commit", type="primary", disabled=not confirmed):
+        with st.spinner("Writing to database..."):
+            res = commit_count(
+                records     = result.records,
+                db          = db,
+                count_date  = str(count_date),
+                imported_by = get_changed_by_fn(),
+                count_type  = count_type,
+            )
+        st.success(
+            f"Done — {res['items_updated']} updated, "
+            f"{res['items_created']} created, "
+            f"{res['items_skipped']} skipped"
+        )
+        if res['errors']:
+            with st.expander(f"⚠️ {len(res['errors'])} error(s)"):
+                for e in res['errors']:
+                    st.caption(e)
