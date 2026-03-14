@@ -4,6 +4,8 @@ Key format: "ITEM NAME||PACKTYPE" (uppercase, double-pipe)
 Supports: Type B vendor invoice CSVs (B1 and B2 subtypes)
 PAC inventory PDFs handled via count_importer.py (separate)
 
+v4.0.1 — Restored detect_encoding() (dropped in v4.0.0; required by gl_manager.py)
+
 v4.0.0 — Added:
   - fuzzy_match_description(): difflib-based candidate lookup (stdlib only)
   - score_import_row(): 0–100 confidence scoring per row
@@ -12,10 +14,32 @@ v4.0.0 — Added:
   - existing_descriptions loaded once per analyze run (no N+1 DB calls)
 """
 import difflib
+import chardet
 import pandas as pd
 import re
 from typing import List, Dict, Tuple, Optional
 from datetime import datetime
+
+
+# -----------------------------------------------------------------------
+# ENCODING DETECTION
+# -----------------------------------------------------------------------
+def detect_encoding(raw_bytes: bytes) -> str:
+    """
+    Detect the character encoding of raw file bytes.
+    Falls back to utf-8 if chardet is unavailable or uncertain.
+    Used by gl_manager.py when loading GL list files that may contain
+    branded product names with ® or ™ characters.
+    """
+    try:
+        result = chardet.detect(raw_bytes)
+        enc = result.get("encoding") or "utf-8"
+        # Prefer utf-8-sig over utf-8 when BOM is present
+        if enc.lower() in ("utf-8-sig", "utf-8") and raw_bytes[:3] == b"\xef\xbb\xbf":
+            return "utf-8-sig"
+        return enc
+    except Exception:
+        return "utf-8"
 
 
 # -----------------------------------------------------------------------
