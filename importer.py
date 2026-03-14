@@ -4,6 +4,10 @@ Key format: "ITEM NAME||PACKTYPE" (uppercase, double-pipe)
 Supports: Type B vendor invoice CSVs (B1 and B2 subtypes)
 PAC inventory PDFs handled via count_importer.py (separate)
 
+v4.0.2 — fixed detect_encoding to support both call styles:
+  - detect_encoding(filepath: str)
+  - detect_encoding(raw_bytes: bytes)
+
 v4.0.1 — Restored detect_encoding() (dropped in v4.0.0; required by gl_manager.py)
 
 v4.0.0 — Added:
@@ -24,24 +28,35 @@ from datetime import datetime
 # -----------------------------------------------------------------------
 # ENCODING DETECTION
 # -----------------------------------------------------------------------
-def detect_encoding(raw_bytes: bytes) -> str:
+def detect_encoding(source) -> str:
     """
-    Detect the character encoding of raw file bytes.
-    Falls back to utf-8 if chardet is unavailable or uncertain.
-    Used by gl_manager.py when loading GL list files that may contain
-    branded product names with ® or ™ characters.
+    Detect encoding from either:
+      • raw bytes (bytes)
+      • a file path (str)
+    Used by gl_manager.py and importer internals.
     """
     try:
-        result = chardet.detect(raw_bytes)
+        import chardet
+
+        # If caller passed a file path
+        if isinstance(source, str):
+            with open(source, "rb") as f:
+                raw = f.read(4096)
+        else:
+            # Assume raw bytes
+            raw = bytes(source)
+
+        result = chardet.detect(raw)
         enc = result.get("encoding") or "utf-8"
-        # Prefer utf-8-sig over utf-8 when BOM is present
-        if enc.lower() in ("utf-8-sig", "utf-8") and raw_bytes[:3] == b"\xef\xbb\xbf":
+
+        # Prefer utf-8-sig if BOM present
+        if enc.lower() in ("utf-8", "utf-8-sig") and raw[:3] == b"\xef\xbb\xbf":
             return "utf-8-sig"
+
         return enc
+
     except Exception:
         return "utf-8"
-
-
 # -----------------------------------------------------------------------
 # NORMALIZERS  (from Production Power Query)
 # -----------------------------------------------------------------------
