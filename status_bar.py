@@ -347,6 +347,36 @@ def _nav_html(menubar: "MenuBar") -> str:
 
 """
 
+def _nav_html(menubar: "MenuBar") -> str:
+    menus_html = ""
+    for menu in menubar.menus:
+        menus_html += _menu_html(
+            menu,
+            lambda flag: menubar.registry.is_enabled(flag),
+        )
+
+    return f"""
+{_CSS}
+{_JS}
+<div id="uha-topnav">
+
+    <!-- ☰ sidebar toggle -->
+    <button id="uha-sidebar-toggle"
+            onclick="uhaToggleSidebar()"
+            title="Toggle sidebar">☰</button>
+
+    <!-- brand -->
+    <span id="uha-brand">🏟️ UHA IMS</span>
+
+    <!-- menus -->
+    <ul class="uha-menu">{menus_html}</ul>
+
+    <!-- right side -->
+    <div class="uha-spacer"></div>
+    <span id="uha-clock"></span>
+
+</div>
+"""
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  PUBLIC — INJECT TOP NAV
