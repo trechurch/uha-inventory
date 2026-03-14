@@ -1,5 +1,17 @@
 # ──────────────────────────────────────────────────────────────────────────────
-#  count_importer.py  —  Multi-Format Count Sheet Importer  v5.0.0
+#  count_importer.py  —  Multi-Format Count Sheet Importer  v5.0.1
+#
+#  CHANGES v5.0.1
+#  ─────────────────────────────────────────────────────────────────────────────
+#  - Added CountImportMeta dataclass (imported by app.py)
+#  - Fixed UOM constants to match HANDOFF ground truth:
+#      '1' moved to CASE_UOMS (BIBs / single-unit bags)
+#      'BOX'/'BX' moved to EACH_UOMS
+#      'SLEEVE'/'SLV'/'CASES'/'CSE' added to correct sets
+#  - commit_count() now returns CountImportMeta (was plain dict)
+#  - commit_count() gracefully handles missing db methods (try/except)
+#  - _verify() tolerance raised to $0.05 (was $0.02) — avoids false
+#    corrections on legitimate rounding in source data
 #
 #  SUPPORTED FORMATS
 #  ─────────────────────────────────────────────────────────────────────────────
@@ -61,7 +73,7 @@ from typing import List, Dict, Optional, Tuple, Any
 
 import pandas as pd
 
-__version__ = "5.0.0"
+__version__ = "5.0.1"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -107,8 +119,13 @@ NON_CHARGEABLE_KEYWORDS = {
     'TEA BAG', 'COFFEE', 'CREAMER', 'SUGAR',
 }
 
-CASE_UOMS = {'CASE', 'CS', 'CTN', 'CA', 'CT', 'BOX', 'BX'}
-EACH_UOMS = {'EACH', 'EA', 'EA.', 'E', '1', 'BAG', 'BG'}
+# ── UOM sets — ground truth from HANDOFF.md ──────────────────────────────────
+# '1' = CASE: BIBs and single-unit bags report UOM as '1' in the PAC export
+# 'BOX'/'BX' = EACH: individual boxes counted as each units
+# 'SLEEVE'/'SLV' = EACH: sleeve-counted items
+CASE_UOMS = {'CASE', 'CS', 'CASES', 'CSE', 'CTN', 'CA', 'CT', '1'}
+EACH_UOMS = {'EACH', 'EA', 'EA.', 'E', 'BAG', 'BG', 'BOX', 'BX',
+             'SLEEVE', 'SLV'}
 
 # Sub-classifications that map to non-chargeable in catering
 NC_SUBCLASSES = {
@@ -121,6 +138,10 @@ NC_SUBCLASSES = {
 LIQUOR_SUBCLASSES = {
     'liquor', 'sidelines liquor', 'suites liquor', 'wine', 'bar cooler',
 }
+
+# Math correction tolerance — differences under this amount are rounding,
+# not real errors.  Raised to $0.05 to avoid false corrections on source data.
+MATH_TOLERANCE = 0.05
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -193,6 +214,36 @@ class ParseResult:
     grand_total:    float
 
 
+@dataclass
+class CountImportMeta:
+    """
+    Summary object returned by commit_count() and used by app.py
+    to display post-commit results.  Combines ParseResult metadata
+    with DB write outcomes in one flat structure.
+    """
+    import_id:     str
+    fmt:           str
+    label:         str
+    count_date:    str
+    imported_by:   str
+    item_count:    int
+    grand_total:   float
+    items_updated: int
+    items_created: int
+    items_skipped: int
+    errors:        List[str]
+    warnings:      List[str]
+    math_errors:   List[str]
+
+    @property
+    def success(self) -> bool:
+        return self.items_updated + self.items_created > 0
+
+    @property
+    def total_processed(self) -> int:
+        return self.items_updated + self.items_created + self.items_skipped
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 #  VALUE CLEANERS
 # ──────────────────────────────────────────────────────────────────────────────
@@ -234,7 +285,6 @@ def _qty2(val) -> float:
 
 def _uom1(val) -> str:
     s = str(val or '').split('/')[0].strip()
-    # strip leading digits+spaces to get just the UOM word
     m = re.search(r'[A-Za-z]+', s)
     return m.group(0).upper() if m else s.upper()
 
@@ -265,14 +315,19 @@ def _item_key(desc: str, pack: str) -> str:
 
 def _verify(qty: float, price: float, total: float,
             label: str) -> Tuple[float, bool, str]:
+    """
+    Verify qty * price == total.  If not, correct qty from total/price.
+    Uses MATH_TOLERANCE ($0.05) to ignore legitimate source rounding.
+    """
     if price <= 0:
         return qty, True, ''
     if total > 0:
         calc = round(qty * price, 2)
-        if abs(calc - total) > 0.02:
+        if abs(calc - total) > MATH_TOLERANCE:
             corrected = round(total / price, 4)
             return corrected, False, (
-                f"{label}: {qty}×${price}=${calc} ≠ file ${total} → using {corrected}"
+                f"{label}: {qty}×${price}=${calc} ≠ file ${total} "
+                f"→ corrected to {corrected}"
             )
     return qty, True, ''
 
@@ -306,8 +361,7 @@ def _load_rows(content: bytes, filename: str) -> Tuple[List[List], str]:
         return [list(r) for r in ws.iter_rows(values_only=True)], ext
 
     if ext == 'csv':
-        # Try multiple encodings
-        for enc in ('utf-8-sig', 'utf-8', 'latin-1'):
+        for enc in ('utf-8-sig', 'utf-8', 'windows-1252', 'latin-1'):
             try:
                 text = content.decode(enc)
                 df   = pd.read_csv(io.StringIO(text), dtype=str,
@@ -355,10 +409,9 @@ class FormatDetector:
             FMT_D: self._score_d(rows),
         }
 
-        best_fmt = max(scores, key=lambda k: scores[k])
+        best_fmt   = max(scores, key=lambda k: scores[k])
         best_score = scores[best_fmt]
-
-        notes = [f"Scores: " + ", ".join(f"{k}={v}" for k, v in scores.items())]
+        notes      = ["Scores: " + ", ".join(f"{k}={v}" for k, v in scores.items())]
 
         if best_score < 40:
             return DetectionResult(FMT_UNKNOWN, best_score,
@@ -375,8 +428,6 @@ class FormatDetector:
             return ''
 
     def _has_compass_header(self, rows) -> bool:
-        """4-row Compass header block: row0 has 'Property Of Compass Group',
-           row1 has cost center name, row4 has 'Grouped by:'"""
         for r in rows[:3]:
             joined = ' '.join(str(c or '') for c in r)
             if 'Compass Group' in joined or 'Property Of' in joined:
@@ -384,7 +435,6 @@ class FormatDetector:
         return False
 
     def _grouped_by_row(self, rows) -> Optional[int]:
-        """Return index of the 'Grouped by:' header row, or None."""
         for i, r in enumerate(rows[:10]):
             joined = ' '.join(str(c or '') for c in r)
             if 'Grouped by' in joined:
@@ -392,12 +442,9 @@ class FormatDetector:
         return None
 
     def _score_a(self, rows) -> int:
-        """Concessions style: no Compass header, has Seq col, two rows per item."""
         score = 0
         if self._has_compass_header(rows):
-            return 0   # definitely not FMT_A
-
-        # Look for header row with Seq
+            return 0
         for r in rows[:5]:
             joined = ' '.join(str(c or '').lower() for c in r)
             if 'seq' in joined and 'item description' in joined:
@@ -409,35 +456,26 @@ class FormatDetector:
                 if 'last inventory' in joined:
                     score += 15
                 break
-
         return min(score, 100)
 
     def _score_b(self, rows) -> int:
-        """Catering two-row, location col, no Seq, no Last Inv Qty."""
         if not self._has_compass_header(rows):
             return 0
         gb = self._grouped_by_row(rows)
         if gb is None:
             return 0
-
         header_row = rows[gb]
-        joined = ' '.join(str(c or '').lower() for c in header_row)
-
-        score = 30  # has compass header + grouped by
+        joined     = ' '.join(str(c or '').lower() for c in header_row)
+        score      = 30
         if '>>' not in joined:
-            score += 20   # no breadcrumb = B not C
+            score += 20
         if 'seq' not in joined:
             score += 20
         if 'last inventory' not in joined:
             score += 15
-
-        # Check data rows — should have location->subclass pattern
         data_rows = rows[gb+1:gb+10]
-        has_arrow = any('->' in str(r[0] or '') for r in data_rows if r)
-        if has_arrow:
+        if any('->' in str(r[0] or '') for r in data_rows if r):
             score += 15
-
-        # Check for slash-delimited cells (would be D not B)
         has_slash = any(
             '/' in str(r[i] or '') and '$' in str(r[i] or '')
             for r in data_rows if r
@@ -445,55 +483,45 @@ class FormatDetector:
         )
         if has_slash:
             score -= 30
-
         return min(score, 100)
 
     def _score_c(self, rows) -> int:
-        """Catering two-row, location col, has Seq + breadcrumb >>."""
         if not self._has_compass_header(rows):
             return 0
         gb = self._grouped_by_row(rows)
         if gb is None:
             return 0
-
         header_row = rows[gb]
-        joined = ' '.join(str(c or '').lower() for c in header_row)
-
-        score = 30
+        joined     = ' '.join(str(c or '').lower() for c in header_row)
+        score      = 30
         if '>>' in joined:
-            score += 30   # breadcrumb header = C signature
+            score += 30
         if 'seq' in joined:
             score += 20
         if 'last inventory' in joined:
             score += 20
-
         return min(score, 100)
 
     def _score_d(self, rows) -> int:
-        """Catering single-row slash-delimited."""
         if not self._has_compass_header(rows):
             return 0
         gb = self._grouped_by_row(rows)
         if gb is None:
             return 0
-
-        score = 20
+        score     = 20
         data_rows = rows[gb+1:gb+15]
-
         slash_price_count = sum(
             1 for r in data_rows if r and len(r) > 3
             and '/' in str(r[3] or '') and '$' in str(r[3] or '')
         )
         if slash_price_count >= 3:
             score += 50
-
         slash_qty_count = sum(
             1 for r in data_rows if r and len(r) > 4
             and '/' in str(r[4] or '')
         )
         if slash_qty_count >= 3:
             score += 30
-
         return min(score, 100)
 
 
@@ -504,7 +532,7 @@ class FormatDetector:
 class ParserA:
 
     def parse(self, content: bytes, filename: str) -> ParseResult:
-        rows, _ = _load_rows(content, filename)
+        rows, _     = _load_rows(content, filename)
         warnings    = []
         math_errors = []
 
@@ -520,7 +548,7 @@ class ParserA:
                                ["Could not find header row"], [], 0.0)
 
         header = [str(c or '').strip().lower() for c in rows[header_idx]]
-        col = {h: i for i, h in enumerate(header)}
+        col    = {h: i for i, h in enumerate(header)}
 
         def gc(row, name):
             i = col.get(name)
@@ -532,15 +560,15 @@ class ParserA:
         raw_pairs = []
         i = 0
         while i < len(data_rows):
-            r = data_rows[i]
+            r    = data_rows[i]
             seq  = str(gc(r, 'seq') or '').strip()
             desc = str(gc(r, 'item description') or '').strip()
             if not seq or not desc:
                 i += 1
                 continue
             if i + 1 < len(data_rows):
-                r2   = data_rows[i + 1]
-                seq2 = str(gc(r2, 'seq') or '').strip()
+                r2    = data_rows[i + 1]
+                seq2  = str(gc(r2, 'seq') or '').strip()
                 desc2 = str(gc(r2, 'item description') or '').strip()
                 if seq2 == seq and desc2 == desc:
                     uom1 = str(gc(r,  'uom') or '').strip().upper()
@@ -554,7 +582,7 @@ class ParserA:
             warnings.append(f"Seq {seq} '{desc}': orphan row — skipped")
             i += 1
 
-        # State machine — same as before
+        # State machine for location + classification
         records         = []
         location_num    = 1
         current_section = None
@@ -566,7 +594,7 @@ class ParserA:
             except ValueError:
                 seq_num = 0
 
-            is_reset = (seq_num <= prev_seq_num) and (prev_seq_num > 0)
+            is_reset   = (seq_num <= prev_seq_num) and (prev_seq_num > 0)
             next_class = _concessions_classify(desc)
 
             if is_reset:
@@ -574,16 +602,16 @@ class ParserA:
                     if next_class == 'NON-CHARGEABLE':
                         current_section = 'NON-CHARGEABLE'
                     else:
-                        location_num += 1
+                        location_num   += 1
                         current_section = 'CHARGEABLE'
                 elif current_section == 'NON-CHARGEABLE':
                     if next_class == 'LIQUOR':
                         current_section = 'LIQUOR'
                     else:
-                        location_num += 1
+                        location_num   += 1
                         current_section = 'CHARGEABLE'
                 elif current_section == 'LIQUOR':
-                    location_num += 1
+                    location_num   += 1
                     current_section = 'CHARGEABLE'
                 else:
                     current_section = next_class
@@ -607,9 +635,11 @@ class ParserA:
             pr_each   = _price(gc(each_row, 'price'))
             tot_each  = _price(gc(each_row, 'total price'))
 
-            label = f"Loc{location_num} Seq{seq_str} '{desc}'"
-            cnt_case, ok1, w1 = _verify(cnt_case, pr_case, tot_case, f"{label} CASE")
-            cnt_each, ok2, w2 = _verify(cnt_each, pr_each, tot_each, f"{label} EACH")
+            label              = f"Loc{location_num} Seq{seq_str} '{desc}'"
+            cnt_case, ok1, w1  = _verify(cnt_case, pr_case, tot_case,
+                                          f"{label} CASE")
+            cnt_each, ok2, w2  = _verify(cnt_each, pr_each, tot_each,
+                                          f"{label} EACH")
             if w1: math_errors.append(w1)
             if w2: math_errors.append(w2)
 
@@ -643,7 +673,8 @@ class ParserA:
             records=records, fmt=FMT_A, confidence=90,
             location_count=locs, item_count=len(records),
             row_count=len(rows), skipped_rows=len(rows) - len(raw_pairs)*2 - 1,
-            warnings=warnings, math_errors=math_errors, grand_total=round(total, 2),
+            warnings=warnings, math_errors=math_errors,
+            grand_total=round(total, 2),
         )
 
 
@@ -667,32 +698,30 @@ class _CateringBase:
         'Cougar Club (Shasta) >> Cat >> DC >> Mfg' → ('Cougar Club (Shasta)', '')
         'Loc->Sub >> Cat >> DC' → ('Loc', 'Sub')
         """
-        raw = str(cell_val or '').strip()
-
-        # Strip >> breadcrumb (keep only the first segment)
-        base = raw.split('>>')[0].strip()
-
+        raw  = str(cell_val or '').strip()
+        base = raw.split('>>')[0].strip()   # strip breadcrumb
         if '->' in base:
             parts = base.split('->', 1)
             return parts[0].strip(), parts[1].strip()
-
         return base, ''
 
     def _is_chargeable(self, sub_class: str) -> bool:
         sc = sub_class.lower()
         if sc in LIQUOR_SUBCLASSES:
-            return True   # liquor is chargeable
+            return True
         if sc in NC_SUBCLASSES:
             return False
-        return True   # default chargeable
+        return True
 
     def _make_record(self, desc, pack, loc_name, sub_class,
                      case_uom, last_case, cnt_case, pr_case, tot_case,
                      each_uom, last_each, cnt_each, pr_each, tot_each,
                      seq, math_errors, fmt) -> CountRecord:
-        label = f"'{loc_name}' '{desc}'"
-        cnt_case, ok1, w1 = _verify(cnt_case, pr_case, tot_case, f"{label} CASE")
-        cnt_each, ok2, w2 = _verify(cnt_each, pr_each, tot_each, f"{label} EACH")
+        label              = f"'{loc_name}' '{desc}'"
+        cnt_case, ok1, w1  = _verify(cnt_case, pr_case, tot_case,
+                                      f"{label} CASE")
+        cnt_each, ok2, w2  = _verify(cnt_each, pr_each, tot_each,
+                                      f"{label} EACH")
         if w1: math_errors.append(w1)
         if w2: math_errors.append(w2)
 
@@ -722,14 +751,12 @@ class _CateringBase:
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  PARSER B  — Catering two-row, location col, no Seq, no Last Inv Qty
-#  Columns: Location | Item Description | UOM | Pack Type | Price | Inv Count
-#           | Total Price
 # ──────────────────────────────────────────────────────────────────────────────
 
 class ParserB(_CateringBase):
 
     def parse(self, content: bytes, filename: str) -> ParseResult:
-        rows, _ = _load_rows(content, filename)
+        rows, _     = _load_rows(content, filename)
         warnings    = []
         math_errors = []
 
@@ -738,7 +765,6 @@ class ParserB(_CateringBase):
             return ParseResult([], FMT_B, 0, 0, 0, len(rows), len(rows),
                                ["Cannot find Grouped-by header"], [], 0.0)
 
-        # Build col map from the header row
         header = [str(c or '').strip().lower() for c in rows[hi]]
         col    = {h: i for i, h in enumerate(header)}
 
@@ -749,63 +775,59 @@ class ParserB(_CateringBase):
                     return row[i]
             return None
 
-        data = rows[hi + 1:]
+        data    = rows[hi + 1:]
         records = []
-        i = 0
+        i       = 0
         skipped = 0
 
         while i < len(data):
             r = data[i]
             if not r or all(str(c or '').strip() == '' for c in r):
-                i += 1
-                skipped += 1
-                continue
+                i += 1; skipped += 1; continue
 
-            loc_raw  = gc(r, 'grouped by: classification', 'classification')
-            desc     = str(gc(r, 'item description') or '').strip()
-            uom1     = str(gc(r, 'uom') or '').strip()
-            pack     = str(gc(r, 'pack type') or '').strip()
-            price1   = _price(gc(r, 'price'))
-            cnt1     = _qty(gc(r, 'inv count'))
-            tot1     = _price(gc(r, 'total price'))
+            loc_raw = gc(r, 'grouped by: classification', 'classification')
+            desc    = str(gc(r, 'item description') or '').strip()
+            uom1    = str(gc(r, 'uom') or '').strip()
+            pack    = str(gc(r, 'pack type') or '').strip()
+            price1  = _price(gc(r, 'price'))
+            cnt1    = _qty(gc(r, 'inv count'))
+            tot1    = _price(gc(r, 'total price'))
 
             if not desc or str(loc_raw or '').strip() in ('', 'Total'):
-                i += 1
-                skipped += 1
-                continue
+                i += 1; skipped += 1; continue
 
             loc_name, sub_class = self._parse_location_cell(loc_raw)
 
-            # Look for matching pair (same desc, same location)
             if i + 1 < len(data):
                 r2       = data[i + 1]
                 loc_raw2 = gc(r2, 'grouped by: classification', 'classification')
                 desc2    = str(gc(r2, 'item description') or '').strip()
 
-                if desc2 == desc and str(loc_raw2 or '').strip() == str(loc_raw or '').strip():
+                if (desc2 == desc and
+                        str(loc_raw2 or '').strip() == str(loc_raw or '').strip()):
                     uom2   = str(gc(r2, 'uom') or '').strip()
                     price2 = _price(gc(r2, 'price'))
                     cnt2   = _qty(gc(r2, 'inv count'))
                     tot2   = _price(gc(r2, 'total price'))
 
-                    # Determine which is case vs each
-                    if uom1.upper() in CASE_UOMS or (uom2.upper() not in CASE_UOMS):
-                        case_u, last_c, cnt_c, pr_c, tot_c = uom1, 0.0, cnt1, price1, tot1
-                        each_u, last_e, cnt_e, pr_e, tot_e = uom2, 0.0, cnt2, price2, tot2
+                    if (uom1.upper() in CASE_UOMS or
+                            uom2.upper() not in CASE_UOMS):
+                        cu, lc, cc, pc, tc = uom1, 0.0, cnt1, price1, tot1
+                        eu, le, ce, pe, te = uom2, 0.0, cnt2, price2, tot2
                     else:
-                        case_u, last_c, cnt_c, pr_c, tot_c = uom2, 0.0, cnt2, price2, tot2
-                        each_u, last_e, cnt_e, pr_e, tot_e = uom1, 0.0, cnt1, price1, tot1
+                        cu, lc, cc, pc, tc = uom2, 0.0, cnt2, price2, tot2
+                        eu, le, ce, pe, te = uom1, 0.0, cnt1, price1, tot1
 
                     records.append(self._make_record(
                         desc, pack, loc_name, sub_class,
-                        case_u, last_c, cnt_c, pr_c, tot_c,
-                        each_u, last_e, cnt_e, pr_e, tot_e,
+                        cu, lc, cc, pc, tc,
+                        eu, le, ce, pe, te,
                         '', math_errors, FMT_B,
                     ))
                     i += 2
                     continue
 
-            # Single row — treat as each-only
+            # Single row — each-only
             records.append(self._make_record(
                 desc, pack, loc_name, sub_class,
                 uom1, 0.0, 0.0, price1, 0.0,
@@ -821,20 +843,19 @@ class ParserB(_CateringBase):
             records=records, fmt=FMT_B, confidence=85,
             location_count=locs, item_count=len(records),
             row_count=len(rows), skipped_rows=skipped,
-            warnings=warnings, math_errors=math_errors, grand_total=round(total, 2),
+            warnings=warnings, math_errors=math_errors,
+            grand_total=round(total, 2),
         )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  PARSER C  — Catering two-row, location col + breadcrumb, has Seq + Last Qty
-#  Columns: Location>>… | Item Description | UOM | Pack Type | Price
-#           | Last Inventory Qty | Seq | Inv Count | Total Price
 # ──────────────────────────────────────────────────────────────────────────────
 
 class ParserC(_CateringBase):
 
     def parse(self, content: bytes, filename: str) -> ParseResult:
-        rows, _ = _load_rows(content, filename)
+        rows, _     = _load_rows(content, filename)
         warnings    = []
         math_errors = []
 
@@ -870,19 +891,18 @@ class ParserC(_CateringBase):
 
             loc_name, sub_class = self._parse_location_cell(loc_raw)
 
-            uom1     = str(gc(r, 'uom') or '').strip()
-            pack     = str(gc(r, 'pack type') or '').strip()
-            price1   = _price(gc(r, 'price'))
-            last1    = _qty(gc(r, 'last inventory qty'))
-            seq_val  = str(gc(r, 'seq') or '').strip()
-            cnt1     = _qty(gc(r, 'inv count'))
-            tot1     = _price(gc(r, 'total price'))
+            uom1    = str(gc(r, 'uom') or '').strip()
+            pack    = str(gc(r, 'pack type') or '').strip()
+            price1  = _price(gc(r, 'price'))
+            last1   = _qty(gc(r, 'last inventory qty'))
+            seq_val = str(gc(r, 'seq') or '').strip()
+            cnt1    = _qty(gc(r, 'inv count'))
+            tot1    = _price(gc(r, 'total price'))
 
-            # Look for pair
             if i + 1 < len(data):
-                r2      = data[i + 1]
-                desc2   = str(gc(r2, 'item description') or '').strip()
-                loc_r2  = str(r2[0] or '').strip() if r2 else ''
+                r2     = data[i + 1]
+                desc2  = str(gc(r2, 'item description') or '').strip()
+                loc_r2 = str(r2[0] or '').strip() if r2 else ''
 
                 if desc2 == desc and loc_r2 == str(loc_raw or '').strip():
                     uom2   = str(gc(r2, 'uom') or '').strip()
@@ -891,17 +911,18 @@ class ParserC(_CateringBase):
                     cnt2   = _qty(gc(r2, 'inv count'))
                     tot2   = _price(gc(r2, 'total price'))
 
-                    if uom1.upper() in CASE_UOMS or (uom2.upper() not in CASE_UOMS):
-                        case_u, last_c, cnt_c, pr_c, tot_c = uom1, last1, cnt1, price1, tot1
-                        each_u, last_e, cnt_e, pr_e, tot_e = uom2, last2, cnt2, price2, tot2
+                    if (uom1.upper() in CASE_UOMS or
+                            uom2.upper() not in CASE_UOMS):
+                        cu, lc, cc, pc, tc = uom1, last1, cnt1, price1, tot1
+                        eu, le, ce, pe, te = uom2, last2, cnt2, price2, tot2
                     else:
-                        case_u, last_c, cnt_c, pr_c, tot_c = uom2, last2, cnt2, price2, tot2
-                        each_u, last_e, cnt_e, pr_e, tot_e = uom1, last1, cnt1, price1, tot1
+                        cu, lc, cc, pc, tc = uom2, last2, cnt2, price2, tot2
+                        eu, le, ce, pe, te = uom1, last1, cnt1, price1, tot1
 
                     records.append(self._make_record(
                         desc, pack, loc_name, sub_class,
-                        case_u, last_c, cnt_c, pr_c, tot_c,
-                        each_u, last_e, cnt_e, pr_e, tot_e,
+                        cu, lc, cc, pc, tc,
+                        eu, le, ce, pe, te,
                         seq_val, math_errors, FMT_C,
                     ))
                     i += 2
@@ -923,21 +944,19 @@ class ParserC(_CateringBase):
             records=records, fmt=FMT_C, confidence=85,
             location_count=locs, item_count=len(records),
             row_count=len(rows), skipped_rows=skipped,
-            warnings=warnings, math_errors=math_errors, grand_total=round(total, 2),
+            warnings=warnings, math_errors=math_errors,
+            grand_total=round(total, 2),
         )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  PARSER D  — Catering single-row, slash-delimited values
-#  Columns: Location | Seq | Item Description | Price($x/$y)
-#           | Last Inventory Qty(x UOM/y EA) | Inv Count(x UOM/y EA)
-#           | Total Price | UOM(case/EA) | Pack Type
 # ──────────────────────────────────────────────────────────────────────────────
 
 class ParserD(_CateringBase):
 
     def parse(self, content: bytes, filename: str) -> ParseResult:
-        rows, _ = _load_rows(content, filename)
+        rows, _     = _load_rows(content, filename)
         warnings    = []
         math_errors = []
 
@@ -971,7 +990,7 @@ class ParserD(_CateringBase):
 
             loc_name, sub_class = self._parse_location_cell(loc_raw)
 
-            seq_val  = str(gc(r, 'seq') or '').strip()
+            seq_val   = str(gc(r, 'seq') or '').strip()
             price_raw = gc(r, 'price')
             last_raw  = gc(r, 'last inventory qty')
             cnt_raw   = gc(r, 'inv count')
@@ -979,8 +998,8 @@ class ParserD(_CateringBase):
             uom_raw   = gc(r, 'uom')
             pack      = str(gc(r, 'pack type') or '').strip()
 
-            pr_case  = _price(price_raw)
-            pr_each  = _price2(price_raw)
+            pr_case   = _price(price_raw)
+            pr_each   = _price2(price_raw)
             last_case = _qty(last_raw)
             last_each = _qty2(last_raw)
             cnt_case  = _qty(cnt_raw)
@@ -988,13 +1007,11 @@ class ParserD(_CateringBase):
             case_uom  = _uom1(uom_raw) if uom_raw else 'CASE'
             each_uom  = _uom2(uom_raw) if uom_raw else 'EACH'
 
-            # Total price is for whichever side had counts
-            # Allocate: if case count > 0, tot_case = cnt_case * pr_case
-            tot_case = round(cnt_case * pr_case, 2) if cnt_case > 0 else 0.0
-            tot_each = round(cnt_each * pr_each, 2) if cnt_each > 0 else 0.0
-            # Verify against file total
+            tot_case   = round(cnt_case * pr_case, 2) if cnt_case > 0 else 0.0
+            tot_each   = round(cnt_each * pr_each, 2) if cnt_each > 0 else 0.0
             calc_total = round(tot_case + tot_each, 2)
-            if tot_val > 0 and abs(calc_total - tot_val) > 0.02:
+
+            if tot_val > 0 and abs(calc_total - tot_val) > MATH_TOLERANCE:
                 math_errors.append(
                     f"'{desc}': reconstructed ${calc_total} ≠ file ${tot_val}"
                 )
@@ -1012,7 +1029,8 @@ class ParserD(_CateringBase):
             records=records, fmt=FMT_D, confidence=85,
             location_count=locs, item_count=len(records),
             row_count=len(rows), skipped_rows=skipped,
-            warnings=warnings, math_errors=math_errors, grand_total=round(total, 2),
+            warnings=warnings, math_errors=math_errors,
+            grand_total=round(total, 2),
         )
 
 
@@ -1037,7 +1055,6 @@ class CountImporter:
     def parse(self, content: bytes, filename: str,
               force_fmt: str = None) -> ParseResult:
         det = self.detector.detect(content, filename)
-
         fmt = force_fmt or det.fmt
         if fmt not in self._parsers:
             return ParseResult(
@@ -1045,8 +1062,7 @@ class CountImporter:
                 [f"No parser available for format: {FORMAT_LABELS.get(fmt, fmt)}"],
                 [], 0.0,
             )
-
-        result = self._parsers[fmt].parse(content, filename)
+        result            = self._parsers[fmt].parse(content, filename)
         result.confidence = det.confidence
         return result
 
@@ -1061,47 +1077,63 @@ def aggregate(records: List[CountRecord]) -> Dict:
 
     for r in records:
         by_location.setdefault(r.location_name, []).append(r)
-        s = summary.setdefault(r.location_name, {})
+        s  = summary.setdefault(r.location_name, {})
         sc = r.sub_class or 'CHARGEABLE'
-        s[sc] = round(s.get(sc, 0.0) + r.total_price, 2)
+        s[sc]       = round(s.get(sc, 0.0) + r.total_price, 2)
         s['_total'] = round(s.get('_total', 0.0) + r.total_price, 2)
 
     return {'by_location': by_location, 'summary': summary}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  DB WRITER
+#  DB WRITER  — returns CountImportMeta
 # ──────────────────────────────────────────────────────────────────────────────
 
 def commit_count(records: List[CountRecord], db, count_date: str,
                  imported_by: str, count_type: str = 'complete',
-                 cost_center: str = 'default') -> Dict:
+                 cost_center: str = 'default',
+                 parse_result: ParseResult = None) -> CountImportMeta:
+    """
+    Write count records to the database and return a CountImportMeta
+    summary object for display in app.py.
 
+    Gracefully handles missing db methods (update_quantity_from_count,
+    log_count_import) so the app doesn't crash if database.py is behind.
+    """
     import_id = (f"CNT-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
                  f"-{uuid.uuid4().hex[:6].upper()}")
-    results = {
-        'import_id':     import_id,
-        'items_updated': 0,
-        'items_created': 0,
-        'items_skipped': 0,
-        'errors':        [],
-        'total_value':   0.0,
-    }
+
+    updated = 0
+    created = 0
+    skipped = 0
+    errors  = []
 
     for r in records:
         try:
-            db_item  = db.get_item(r.item_key)
-            prev_qty = float(db_item['quantity_on_hand']) if db_item else 0.0
-            new_qty  = r.count_qty_each
+            db_item = db.get_item(r.item_key)
+            new_qty = r.count_qty_each
 
             if db_item:
-                ok = db.update_quantity_from_count(
-                    r.item_key, new_qty, import_id, changed_by=imported_by)
-                if ok:
-                    results['items_updated'] += 1
+                # Prefer the dedicated count method; fall back to _apply_update
+                if hasattr(db, 'update_quantity_from_count'):
+                    ok = db.update_quantity_from_count(
+                        r.item_key, new_qty, import_id,
+                        changed_by=imported_by
+                    )
                 else:
-                    results['items_skipped'] += 1
-                    results['errors'].append(f"Update failed: {r.item_key}")
+                    ok = db._apply_update(
+                        r.item_key,
+                        {'quantity_on_hand': new_qty,
+                         'status_tag': '📋 Count Import'},
+                        change_source='count_import',
+                        source_document=import_id,
+                        changed_by=imported_by,
+                    )
+                if ok:
+                    updated += 1
+                else:
+                    skipped += 1
+                    errors.append(f"Update failed: {r.item_key}")
             else:
                 db.add_item({
                     'key':              r.item_key,
@@ -1113,30 +1145,53 @@ def commit_count(records: List[CountRecord], db, count_date: str,
                     'cost_center':      cost_center,
                     'status_tag':       '📦 Count Import',
                 }, changed_by=imported_by)
-                results['items_created'] += 1
-
-            results['total_value'] += r.total_price
+                created += 1
 
         except Exception as e:
-            results['errors'].append(f"{r.item_key}: {e}")
-            results['items_skipped'] += 1
+            errors.append(f"{r.item_key}: {e}")
+            skipped += 1
 
+    # Write import log — graceful fallback if method missing
+    grand_total = sum(r.total_price for r in records)
     try:
-        db.log_count_import(
-            import_id=import_id, source_file='' ,file_format='multi',
-            data_layout=records[0].source_fmt if records else '',
-            count_type=count_type, count_date=count_date,
-            cost_center=cost_center, imported_by=imported_by,
-            total_items=len(records),
-            items_changed=results['items_updated'] + results['items_created'],
-            items_flagged=0, total_prev_value=0.0,
-            total_new_value=results['total_value'],
-            variance_value=results['total_value'],
-        )
+        if hasattr(db, 'log_count_import'):
+            db.log_count_import(
+                import_id=import_id,
+                source_file='',
+                file_format='multi',
+                data_layout=records[0].source_fmt if records else '',
+                count_type=count_type,
+                count_date=count_date,
+                cost_center=cost_center,
+                imported_by=imported_by,
+                total_items=len(records),
+                items_changed=updated + created,
+                items_flagged=0,
+                total_prev_value=0.0,
+                total_new_value=grand_total,
+                variance_value=grand_total,
+            )
     except Exception as e:
-        results['errors'].append(f"Import log failed: {e}")
+        errors.append(f"Import log failed: {e}")
 
-    return results
+    fmt   = records[0].source_fmt if records else ''
+    label = FORMAT_LABELS.get(fmt, fmt)
+
+    return CountImportMeta(
+        import_id     = import_id,
+        fmt           = fmt,
+        label         = label,
+        count_date    = count_date,
+        imported_by   = imported_by,
+        item_count    = len(records),
+        grand_total   = round(grand_total, 2),
+        items_updated = updated,
+        items_created = created,
+        items_skipped = skipped,
+        errors        = errors,
+        warnings      = parse_result.warnings    if parse_result else [],
+        math_errors   = parse_result.math_errors if parse_result else [],
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1160,7 +1215,7 @@ def render_count_import_page(db, get_changed_by_fn):
     content  = uploaded.read()
     importer = CountImporter()
 
-    # ── Detection ──────────────────────────────────────────────────────────────
+    # ── Detection ─────────────────────────────────────────────────────────────
     det = importer.detect(content, uploaded.name)
 
     if det.fmt == FMT_E:
@@ -1181,8 +1236,7 @@ def render_count_import_page(db, get_changed_by_fn):
         )
         fmt = det.fmt
         if det.is_uncertain:
-            override = st.checkbox("Override detected format")
-            if override:
+            if st.checkbox("Override detected format"):
                 fmt = st.selectbox("Select format", list(FORMAT_LABELS.keys()),
                                    format_func=lambda k: FORMAT_LABELS[k])
 
@@ -1210,7 +1264,7 @@ def render_count_import_page(db, get_changed_by_fn):
             for e in result.math_errors:
                 st.caption(e)
 
-    # ── Location summary ───────────────────────────────────────────────────────
+    # ── Location summary ──────────────────────────────────────────────────────
     agg = aggregate(result.records)
     st.markdown("---")
     st.subheader("📍 Location Summary")
@@ -1234,7 +1288,8 @@ def render_count_import_page(db, get_changed_by_fn):
 
     loc_options = sorted(agg['by_location'].keys())
     selected    = st.selectbox("Location", ["All"] + loc_options)
-    view        = result.records if selected == "All" else agg['by_location'][selected]
+    view        = (result.records if selected == "All"
+                   else agg['by_location'][selected])
 
     detail_df = pd.DataFrame([{
         'Location':    r.location_name,
@@ -1270,18 +1325,25 @@ def render_count_import_page(db, get_changed_by_fn):
     )
     if st.button("✅ Commit", type="primary", disabled=not confirmed):
         with st.spinner("Writing to database…"):
-            res = commit_count(
-                records=result.records, db=db,
-                count_date=str(count_date),
-                imported_by=get_changed_by_fn(),
-                count_type=count_type,
+            meta = commit_count(
+                records      = result.records,
+                db           = db,
+                count_date   = str(count_date),
+                imported_by  = get_changed_by_fn(),
+                count_type   = count_type,
+                parse_result = result,
             )
-        st.success(
-            f"Done — {res['items_updated']} updated, "
-            f"{res['items_created']} created, "
-            f"{res['items_skipped']} skipped"
-        )
-        if res['errors']:
-            with st.expander(f"⚠️ {len(res['errors'])} error(s)"):
-                for e in res['errors']:
+        if meta.success:
+            st.success(
+                f"Done — {meta.items_updated} updated, "
+                f"{meta.items_created} created, "
+                f"{meta.items_skipped} skipped  "
+                f"(Import ID: `{meta.import_id}`)"
+            )
+        else:
+            st.error("Commit completed but no items were written. Check errors below.")
+
+        if meta.errors:
+            with st.expander(f"⚠️ {len(meta.errors)} error(s)"):
+                for e in meta.errors:
                     st.caption(e)

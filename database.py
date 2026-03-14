@@ -3,6 +3,11 @@ Inventory Database - PostgreSQL/Supabase version
 Drop-in replacement for SQLite database.py
 Connection string loaded from environment / Streamlit secrets
 
+v4.0.1 — Added:
+  - import_log table (count import audit trail)
+  - update_quantity_from_count() — called by count_importer.commit_count()
+  - log_count_import()           — called by count_importer.commit_count()
+
 v4.0.0 — Added:
   - is_manual_override / manual_notes on items (migration-safe)
   - inventory_transactions table (full operational audit trail)
@@ -166,6 +171,32 @@ class InventoryDatabase:
                     yield_adjusted  BOOLEAN DEFAULT TRUE,
                     notes           TEXT
                 );
+
+                -- ── COUNT IMPORT LOG ─────────────────────────────────────
+                -- Written by count_importer.commit_count() after every
+                -- successful count sheet commit.
+                CREATE TABLE IF NOT EXISTS import_log (
+                    import_id        TEXT PRIMARY KEY,
+                    source_file      TEXT,
+                    file_format      TEXT,
+                    data_layout      TEXT,
+                    count_type       TEXT,
+                    count_date       DATE,
+                    cost_center      TEXT,
+                    imported_by      TEXT,
+                    imported_at      TIMESTAMPTZ DEFAULT NOW(),
+                    total_items      INTEGER DEFAULT 0,
+                    items_changed    INTEGER DEFAULT 0,
+                    items_flagged    INTEGER DEFAULT 0,
+                    total_prev_value NUMERIC(12,4) DEFAULT 0,
+                    total_new_value  NUMERIC(12,4) DEFAULT 0,
+                    variance_value   NUMERIC(12,4) DEFAULT 0
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_import_log_date
+                    ON import_log(count_date DESC);
+                CREATE INDEX IF NOT EXISTS idx_import_log_cost_center
+                    ON import_log(cost_center);
 
                 -- ── COUNT OVERRIDES (existing) ────────────────────────────
                 CREATE TABLE IF NOT EXISTS count_overrides (
@@ -824,6 +855,85 @@ class InventoryDatabase:
                 SELECT * FROM price_history WHERE item_key = %s
                 ORDER BY doc_date DESC LIMIT %s
             """, (key, limit))
+            return [dict(r) for r in cur.fetchall()]
+
+    # ------------------------------------------------------------------
+    # COUNT IMPORT HELPERS  (called by count_importer.commit_count)
+    # ------------------------------------------------------------------
+    def update_quantity_from_count(self, key: str, new_qty: float,
+                                   import_id: str,
+                                   changed_by: str = "count_import") -> bool:
+        """
+        Update quantity_on_hand from a count sheet commit.
+        Also writes to item_history for full audit trail.
+        Returns True on success, False if item not found or error.
+        """
+        current = self.get_item(key)
+        if not current:
+            return False
+        old_qty = current.get("quantity_on_hand", 0)
+        updates = {
+            "quantity_on_hand": new_qty,
+            "last_updated":     datetime.utcnow(),
+            "status_tag":       "📋 Count Import",
+        }
+        ok = self._apply_update(key, updates,
+                                change_source="count_import",
+                                source_document=import_id,
+                                changed_by=changed_by)
+        if ok:
+            # Also log to inventory_transactions
+            self.log_transaction(
+                item_key=key,
+                tx_type="PAC_COUNT",
+                quantity=new_qty,
+                source_document=import_id,
+                changed_by=changed_by,
+                notes=f"Previous QOH: {old_qty}"
+            )
+        return ok
+
+    def log_count_import(self, import_id: str, source_file: str,
+                         file_format: str, data_layout: str,
+                         count_type: str, count_date: str,
+                         cost_center: str, imported_by: str,
+                         total_items: int, items_changed: int,
+                         items_flagged: int, total_prev_value: float,
+                         total_new_value: float,
+                         variance_value: float) -> bool:
+        """
+        Write one row to import_log after a count sheet commit.
+        Called by count_importer.commit_count().
+        """
+        try:
+            with get_conn() as conn:
+                cur = conn.cursor()
+                cur.execute("""
+                    INSERT INTO import_log
+                    (import_id, source_file, file_format, data_layout,
+                     count_type, count_date, cost_center, imported_by,
+                     total_items, items_changed, items_flagged,
+                     total_prev_value, total_new_value, variance_value)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT (import_id) DO NOTHING
+                """, (import_id, source_file, file_format, data_layout,
+                      count_type, count_date, cost_center, imported_by,
+                      total_items, items_changed, items_flagged,
+                      total_prev_value, total_new_value, variance_value))
+            return True
+        except Exception as e:
+            print(f"Error logging count import: {e}")
+            return False
+
+    def get_import_log(self, limit: int = 50) -> List[Dict]:
+        """Fetch recent count import records, newest first."""
+        with get_conn() as conn:
+            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cur.execute("""
+                SELECT * FROM import_log
+                ORDER BY imported_at DESC
+                LIMIT %s
+            """, (limit,))
             return [dict(r) for r in cur.fetchall()]
 
     # ------------------------------------------------------------------
