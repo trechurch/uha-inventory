@@ -35,15 +35,16 @@ __version__ = "3.1.5"
 
 _CSS = """
 <style>
+
 /* ── Hide Streamlit's internal decoration span (prevents stray <span> at top) ── */
 span[data-testid="stDecoration"] {
     display: none !important;
 }
-
 /* Some Streamlit versions inject a plain <span> as the first child of .stApp */
 .stApp > span:first-child {
     display: none !important;
 }
+
 /* ── Global page adjustments ─────────────────────────────────────────────── */
 /* Push Streamlit's default content down so it doesn't hide under the nav bar */
 .stApp > header { display: none !important; }
@@ -342,6 +343,27 @@ def _nav_html(menubar: "MenuBar") -> str:
     return f"""
 {_CSS}
 {_JS}
+
+<div id="uha-topnav">
+
+    <!-- ☰ sidebar toggle -->
+    <button id="uha-sidebar-toggle"
+            onclick="uhaToggleSidebar()"
+            title="Toggle sidebar">☰</button>
+
+    <!-- brand -->
+    <span id="uha-brand">🏟️ UHA IMS</span>
+
+    <!-- menus -->
+    <ul class="uha-menu">{menus_html}</ul>
+
+    <!-- right side -->
+    <div class="uha-spacer"></div>
+    <span id="uha-clock"></span>
+
+</div>
+"""
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  PUBLIC — INJECT TOP NAV
