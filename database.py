@@ -66,57 +66,52 @@ class InventoryDatabase:
     # SCHEMA — base tables (CREATE IF NOT EXISTS is idempotent)
     # ------------------------------------------------------------------
     def create_tables(self):
-        with get_conn() as conn:
-            cur = conn.cursor()
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS items (
-                    key                  TEXT PRIMARY KEY,
-                    description          TEXT,
-                    pack_type            TEXT,
-                    cost                 NUMERIC(10,4) DEFAULT 0,
-                    per                  TEXT,
-                    conv_ratio           NUMERIC(10,4) DEFAULT 1.0,
-                    unit                 TEXT,
-                    vendor               TEXT,
-                    item_number          TEXT,
-                    mog                  TEXT,
-                    spacer               TEXT,
-                    brand                TEXT,
-                    last_updated         TIMESTAMPTZ,
-                    yield                NUMERIC(10,4) DEFAULT 1.0,
-                    gl_code              TEXT,
-                    gl_name              TEXT,
-                    override_pack_type   TEXT,
-                    override_yield       NUMERIC(10,4),
-                    override_conv_ratio  NUMERIC(10,4),
-                    override_vendor      TEXT,
-                    override_item_number TEXT,
-                    override_gl          TEXT,
-                    status_tag           TEXT DEFAULT 'Standard',
-                    quantity_on_hand     NUMERIC(10,4) DEFAULT 0,
-                    reorder_point        NUMERIC(10,4) DEFAULT 0,
-                    is_chargeable        BOOLEAN DEFAULT TRUE,
-                    cost_center          TEXT,
-                    record_status        TEXT DEFAULT 'active',
-                    created_date         TIMESTAMPTZ DEFAULT NOW(),
-                    user_notes           TEXT,
-                    gtin                 TEXT
-                );
+    """Create all tables in correct order for PostgreSQL"""
+    cur = self.conn.cursor()
+    
+    # 1. Main items table (NO foreign keys yet)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS items (
+            key TEXT PRIMARY KEY,
+            description TEXT,
+            pack_size TEXT,
+            base_unit TEXT,
+            base_unit_value REAL,
+            yield REAL DEFAULT 1.0,
+            shelf_life_days INTEGER,
+            quantity_on_hand REAL DEFAULT 0,
+            reorder_point REAL,
+            current_cost REAL,
+            current_vendor TEXT,
+            last_updated DATE,
+            created_date DATE,
+            status TEXT DEFAULT 'active',
+            user_notes TEXT,
+            brand TEXT,
+            mog TEXT,
+            gtin TEXT,
+            gl_code TEXT,
+            gl_name TEXT
+        )
+    """)
 
-                CREATE TABLE IF NOT EXISTS item_history (
-                    history_id      SERIAL PRIMARY KEY,
-                    item_key        TEXT REFERENCES items(key),
-                    change_date     TIMESTAMPTZ DEFAULT NOW(),
-                    change_type     TEXT,
-                    field_changed   TEXT,
-                    old_value       TEXT,
-                    new_value       TEXT,
-                    change_source   TEXT,
-                    source_document TEXT,
-                    changed_by      TEXT,
-                    change_reason   TEXT,
-                    metadata        JSONB
-                );
+    # 2. History table
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS item_history (
+            history_id SERIAL PRIMARY KEY,
+            item_key TEXT,
+            change_date TIMESTAMP,
+            change_type TEXT,
+            field_changed TEXT,
+            old_value TEXT,
+            new_value TEXT,
+            change_source TEXT,
+            source_document TEXT,
+            changed_by TEXT,
+            change_reason TEXT,
+            metadata TEXT,
+            FOREIGN KEY (item_key) REFERENCES items(key) ON DELETE CASCADE
+        );
 
                 CREATE TABLE IF NOT EXISTS price_history (
                     price_id    SERIAL PRIMARY KEY,
