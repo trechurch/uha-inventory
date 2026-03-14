@@ -1927,7 +1927,7 @@ def main():
 
     # ── Auth gate — must resolve identity before ANY page renders ─────────────
     if not require_auth(_get_db()):
-        return   # login form is showing — stop here
+          st.stop()
 
     reg         = st.session_state["_registry"]
     sidebar_cfg = st.session_state["_sidebar_cfg"]
