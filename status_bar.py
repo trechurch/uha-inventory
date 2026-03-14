@@ -343,27 +343,6 @@ def _nav_html(menubar: "MenuBar") -> str:
 {_CSS}
 {_JS}
 
-<div id="uha-topnav">
-
-    <!-- ☰ sidebar toggle -->
-    <button id="uha-sidebar-toggle"
-            onclick="uhaToggleSidebar()"
-            title="Toggle sidebar">☰</button>
-
-    <!-- brand -->
-    <span id="uha-brand">🏟️ UHA IMS</span>
-
-    <!-- menus -->
-    <ul class="uha-menu">{menus_html}</ul>
-
-    <!-- right side -->
-    <div class="uha-spacer"></div>
-    <span id="uha-clock"></span>
-
-</div>
-"""
-
-
 # ──────────────────────────────────────────────────────────────────────────────
 #  PUBLIC — INJECT TOP NAV
 # ──────────────────────────────────────────────────────────────────────────────
