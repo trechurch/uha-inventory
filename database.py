@@ -62,57 +62,71 @@ class InventoryDatabase:
         self.create_tables()
         self._run_migrations()
 
-    # ------------------------------------------------------------------
+       # ------------------------------------------------------------------
     # SCHEMA — base tables (CREATE IF NOT EXISTS is idempotent)
     # ------------------------------------------------------------------
     def create_tables(self):
-    """Create all tables in correct order for PostgreSQL"""
-    cur = self.conn.cursor()
-    
-    # 1. Main items table (NO foreign keys yet)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS items (
-            key TEXT PRIMARY KEY,
-            description TEXT,
-            pack_size TEXT,
-            base_unit TEXT,
-            base_unit_value REAL,
-            yield REAL DEFAULT 1.0,
-            shelf_life_days INTEGER,
-            quantity_on_hand REAL DEFAULT 0,
-            reorder_point REAL,
-            current_cost REAL,
-            current_vendor TEXT,
-            last_updated DATE,
-            created_date DATE,
-            status TEXT DEFAULT 'active',
-            user_notes TEXT,
-            brand TEXT,
-            mog TEXT,
-            gtin TEXT,
-            gl_code TEXT,
-            gl_name TEXT
-        )
-    """)
+        """Create all tables in correct order for PostgreSQL"""
+        with get_conn() as conn:
+            cur = conn.cursor()
 
-    # 2. History table
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS item_history (
-            history_id SERIAL PRIMARY KEY,
-            item_key TEXT,
-            change_date TIMESTAMP,
-            change_type TEXT,
-            field_changed TEXT,
-            old_value TEXT,
-            new_value TEXT,
-            change_source TEXT,
-            source_document TEXT,
-            changed_by TEXT,
-            change_reason TEXT,
-            metadata TEXT,
-            FOREIGN KEY (item_key) REFERENCES items(key) ON DELETE CASCADE
-        );
+            # 1. Main items table
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS items (
+                    key                  TEXT PRIMARY KEY,
+                    description          TEXT,
+                    pack_type            TEXT,
+                    cost                 NUMERIC(10,4) DEFAULT 0,
+                    per                  TEXT,
+                    conv_ratio           NUMERIC(10,4) DEFAULT 1.0,
+                    unit                 TEXT,
+                    vendor               TEXT,
+                    item_number          TEXT,
+                    mog                  TEXT,
+                    spacer               TEXT,
+                    brand                TEXT,
+                    last_updated         TIMESTAMPTZ,
+                    yield                NUMERIC(10,4) DEFAULT 1.0,
+                    gl_code              TEXT,
+                    gl_name              TEXT,
+                    override_pack_type   TEXT,
+                    override_yield       NUMERIC(10,4),
+                    override_conv_ratio  NUMERIC(10,4),
+                    override_vendor      TEXT,
+                    override_item_number TEXT,
+                    override_gl          TEXT,
+                    status_tag           TEXT DEFAULT 'Standard',
+                    quantity_on_hand     NUMERIC(10,4) DEFAULT 0,
+                    reorder_point        NUMERIC(10,4) DEFAULT 0,
+                    is_chargeable        BOOLEAN DEFAULT TRUE,
+                    cost_center          TEXT,
+                    record_status        TEXT DEFAULT 'active',
+                    created_date         TIMESTAMPTZ DEFAULT NOW(),
+                    user_notes           TEXT,
+                    gtin                 TEXT
+                );
+            """)
 
+            # 2. History table
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS item_history (
+                    history_id      SERIAL PRIMARY KEY,
+                    item_key        TEXT REFERENCES items(key),
+                    change_date     TIMESTAMPTZ DEFAULT NOW(),
+                    change_type     TEXT,
+                    field_changed   TEXT,
+                    old_value       TEXT,
+                    new_value       TEXT,
+                    change_source   TEXT,
+                    source_document TEXT,
+                    changed_by      TEXT,
+                    change_reason   TEXT,
+                    metadata        JSONB
+                );
+            """)
+
+            # 3. Price history
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS price_history (
                     price_id    SERIAL PRIMARY KEY,
                     item_key    TEXT REFERENCES items(key),
@@ -122,10 +136,10 @@ class InventoryDatabase:
                     vendor      TEXT,
                     imported_at TIMESTAMPTZ DEFAULT NOW()
                 );
+            """)
 
-                -- ── OPERATIONAL TRANSACTION LOG ──────────────────────────
-                -- Every physical movement: receives, counts, issues,
-                -- transfers, adjustments. QOH is derived from this table.
+            # 4. Inventory transactions
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS inventory_transactions (
                     tx_id           SERIAL PRIMARY KEY,
                     item_key        TEXT REFERENCES items(key),
@@ -140,8 +154,10 @@ class InventoryDatabase:
                     changed_by      TEXT,
                     notes           TEXT
                 );
+            """)
 
-                -- ── PCA / RECIPE ENGINE FOUNDATION ───────────────────────
+            # 5. Recipes
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS recipes (
                     recipe_id    SERIAL PRIMARY KEY,
                     menu_item    TEXT UNIQUE NOT NULL,
@@ -155,7 +171,10 @@ class InventoryDatabase:
                     created_date TIMESTAMPTZ DEFAULT NOW(),
                     last_updated TIMESTAMPTZ
                 );
+            """)
 
+            # 6. Recipe ingredients
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS recipe_ingredients (
                     ingredient_id   SERIAL PRIMARY KEY,
                     recipe_id       INTEGER REFERENCES recipes(recipe_id)
@@ -166,10 +185,10 @@ class InventoryDatabase:
                     yield_adjusted  BOOLEAN DEFAULT TRUE,
                     notes           TEXT
                 );
+            """)
 
-                -- ── COUNT IMPORT LOG ─────────────────────────────────────
-                -- Written by count_importer.commit_count() after every
-                -- successful count sheet commit.
+            # 7. Count import log
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS import_log (
                     import_id        TEXT PRIMARY KEY,
                     source_file      TEXT,
@@ -187,13 +206,10 @@ class InventoryDatabase:
                     total_new_value  NUMERIC(12,4) DEFAULT 0,
                     variance_value   NUMERIC(12,4) DEFAULT 0
                 );
+            """)
 
-                CREATE INDEX IF NOT EXISTS idx_import_log_date
-                    ON import_log(count_date DESC);
-                CREATE INDEX IF NOT EXISTS idx_import_log_cost_center
-                    ON import_log(cost_center);
-
-                -- ── COUNT OVERRIDES (existing) ────────────────────────────
+            # 8. Count overrides
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS count_overrides (
                     override_id  SERIAL PRIMARY KEY,
                     item_key     TEXT,
@@ -203,32 +219,25 @@ class InventoryDatabase:
                     created_date TIMESTAMPTZ DEFAULT NOW(),
                     UNIQUE (item_key, cost_center)
                 );
+            """)
 
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS count_override_settings (
                     setting_key   TEXT PRIMARY KEY,
                     setting_value TEXT
                 );
-
-                -- ── INDEXES ──────────────────────────────────────────────
-                CREATE INDEX IF NOT EXISTS idx_items_description
-                    ON items(description);
-                CREATE INDEX IF NOT EXISTS idx_items_gl_code
-                    ON items(gl_code);
-                CREATE INDEX IF NOT EXISTS idx_items_vendor
-                    ON items(vendor);
-                CREATE INDEX IF NOT EXISTS idx_history_item_key
-                    ON item_history(item_key);
-                CREATE INDEX IF NOT EXISTS idx_tx_item_key
-                    ON inventory_transactions(item_key);
-                CREATE INDEX IF NOT EXISTS idx_tx_type
-                    ON inventory_transactions(tx_type);
-                CREATE INDEX IF NOT EXISTS idx_tx_date
-                    ON inventory_transactions(tx_date);
-                CREATE INDEX IF NOT EXISTS idx_recipe_ingredients_recipe
-                    ON recipe_ingredients(recipe_id);
-                CREATE INDEX IF NOT EXISTS idx_recipe_ingredients_item
-                    ON recipe_ingredients(item_key);
             """)
+
+            # 9. Indexes
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_items_description ON items(description);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_items_gl_code ON items(gl_code);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_items_vendor ON items(vendor);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_history_item_key ON item_history(item_key);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_tx_item_key ON inventory_transactions(item_key);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_tx_type ON inventory_transactions(tx_type);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_tx_date ON inventory_transactions(tx_date);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_recipe_ingredients_recipe ON recipe_ingredients(recipe_id);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_recipe_ingredients_item ON recipe_ingredients(item_key);")
 
     # ------------------------------------------------------------------
     # MIGRATIONS — safe ALTER TABLE for columns added after initial deploy
