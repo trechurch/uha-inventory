@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 
 # ── end of imports ────────────────────────────────────────────────────────────
 
-__version__ = "3.1.0"
+__version__ = "3.1.5"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -35,7 +35,15 @@ __version__ = "3.1.0"
 
 _CSS = """
 <style>
+/* ── Hide Streamlit's internal decoration span (prevents stray <span> at top) ── */
+span[data-testid="stDecoration"] {
+    display: none !important;
+}
 
+/* Some Streamlit versions inject a plain <span> as the first child of .stApp */
+.stApp > span:first-child {
+    display: none !important;
+}
 /* ── Global page adjustments ─────────────────────────────────────────────── */
 /* Push Streamlit's default content down so it doesn't hide under the nav bar */
 .stApp > header { display: none !important; }
