@@ -2,13 +2,13 @@
 # ──────────────────────────────────────────────────────────────────────────────
 #  VERSION
 # ──────────────────────────────────────────────────────────────────────────────
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 
 """
 All page-level UI functions for UHA IMS.
-Dependencies (db, importer, gl, od) are injected by app.py — this module
-makes no direct calls to get_db() / cache_resource and imports no Streamlit
-globals from app.py.  That keeps each side independently testable.
+Dependencies (db, importer, gl, od) are injected by app.py.
+v1.6.0 — page_inventory now uses click-to-select row selection
+         (st.dataframe on_select="rerun") instead of a separate dropdown.
 """
 
 # ── Standard library ──────────────────────────────────────────────────────────
@@ -67,7 +67,7 @@ def page_dashboard(db) -> None:
 
 
 # ────────────────────────────────────────────────────────────────────
-# INVENTORY LIST + EDITOR
+# INVENTORY LIST + CLICK-TO-EDIT
 # ────────────────────────────────────────────────────────────────────
 
 def page_inventory(db) -> None:
@@ -105,26 +105,44 @@ def page_inventory(db) -> None:
         if c in df.columns
     ]
 
-    st.caption(f"{len(df)} items")
-    st.dataframe(df[display_cols], use_container_width=True, hide_index=True)
+    st.caption(f"{len(df)} items · Click a row to edit")
+
+    # ── Click-to-select table ─────────────────────────────────────────
+    event = st.dataframe(
+        df[display_cols],
+        use_container_width=True,
+        hide_index=True,
+        on_select="rerun",
+        selection_mode="single-row",
+        key="inv_table",
+    )
+
+    selected_rows = (
+        event.selection.rows
+        if hasattr(event, "selection") and event.selection
+        else st.session_state.get("inv_table", {}).get("selection", {}).get("rows", [])
+    )
 
     st.markdown("---")
     st.subheader("✏️ Edit Item")
 
-    keys = [i["key"] for i in items]
-    selected_key = st.selectbox(
-        "Select item to edit", keys,
-        format_func=lambda k: k.split("||")[0]
-    )
-
-    if selected_key:
-        item = db.get_item(selected_key)
-        if item:
-            _edit_item_form(db, item)
+    if selected_rows:
+        row     = df.iloc[selected_rows[0]]
+        item_key = row.get("key") or row.get("item_key", "")
+        if item_key:
+            item = db.get_item(item_key)
+            if item:
+                _edit_item_form(db, item)
+            else:
+                st.warning(f"Could not load item: `{item_key}`")
+        else:
+            st.warning("Selected row has no item key.")
+    else:
+        st.info("👆 Click a row in the table above to populate the edit form.")
 
 
 def _edit_item_form(db, item: dict) -> None:
-    with st.form("edit_item"):
+    with st.form("edit_item_form"):
         col1, col2, col3 = st.columns(3)
 
         with col1:
@@ -143,7 +161,7 @@ def _edit_item_form(db, item: dict) -> None:
 
         with col3:
             yield_val  = st.number_input(
-                "Yield", value=float(item.get("yield") or 1.0), format="%.4f"
+                "Yield",       value=float(item.get("yield") or 1.0),  format="%.4f"
             )
             conv_ratio = st.number_input(
                 "Conv. Ratio", value=float(item.get("conv_ratio") or 1.0), format="%.4f"
@@ -159,7 +177,8 @@ def _edit_item_form(db, item: dict) -> None:
         lock_yield = oc2.checkbox("Lock Yield",       value=bool(item.get("override_yield")))
         lock_conv  = oc3.checkbox("Lock Conv. Ratio", value=bool(item.get("override_conv_ratio")))
 
-        submitted = st.form_submit_button("💾 Save Changes")
+        st.caption(f"Key: `{item.get('key', '—')}`")
+        submitted = st.form_submit_button("💾 Save Changes", type="primary")
 
     if not submitted:
         return
@@ -205,7 +224,7 @@ def _edit_item_form(db, item: dict) -> None:
 
 
 # ────────────────────────────────────────────────────────────────────
-# IMPORT
+# IMPORT (vendor invoices)
 # ────────────────────────────────────────────────────────────────────
 
 def page_import(db, importer, od) -> None:
@@ -213,7 +232,6 @@ def page_import(db, importer, od) -> None:
 
     tab1, tab2 = st.tabs(["📤 Upload from Computer", "☁️ Import from OneDrive"])
 
-    # ── Tab 1: upload from local disk ────────────────────────────────
     with tab1:
         st.subheader("Upload Invoice or Inventory CSV")
         uploaded = st.file_uploader(
@@ -241,7 +259,6 @@ def page_import(db, importer, od) -> None:
                         continue
 
                     analysis = importer.analyze_import(df)
-
                     col1, col2, col3 = st.columns(3)
                     col1.metric("New Items",   len(analysis["new_items"]))
                     col2.metric("Updates",     len(analysis["updates"]))
@@ -284,7 +301,6 @@ def page_import(db, importer, od) -> None:
                 except Exception as e:
                     st.error(f"Error processing {f.name}: {e}")
 
-    # ── Tab 2: pull from OneDrive ─────────────────────────────────────
     with tab2:
         if not od.get_access_token():
             st.warning("Connect to OneDrive first (sidebar).")
@@ -295,10 +311,10 @@ def page_import(db, importer, od) -> None:
                 st.info("No files found in your OneDrive Imports folder.")
             else:
                 for f in files:
-                    col1, col2, col3 = st.columns([4, 2, 1])
-                    col1.write(f["name"])
-                    col2.write(f.get("modified", "")[:10])
-                    if col3.button("Import", key=f"od_{f['name']}"):
+                    c1, c2, c3 = st.columns([4, 2, 1])
+                    c1.write(f["name"])
+                    c2.write(f.get("modified", "")[:10])
+                    if c3.button("Import", key=f"od_{f['name']}"):
                         content = od.download_import_file(f["name"])
                         if content:
                             st.info(f"Processing {f['name']}...")
@@ -418,7 +434,6 @@ def page_export(db, od) -> None:
 
     df = pd.DataFrame(items)
 
-    # ── Excel ─────────────────────────────────────────────────────────
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Inventory")
@@ -430,7 +445,6 @@ def page_export(db, od) -> None:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
-    # ── CSV ───────────────────────────────────────────────────────────
     csv = df.to_csv(index=False)
     st.download_button(
         "⬇️ Download as CSV",
@@ -440,7 +454,6 @@ def page_export(db, od) -> None:
     )
     st.caption(f"{len(df)} items")
 
-    # ── OneDrive ──────────────────────────────────────────────────────
     if od.get_access_token():
         st.subheader("Save to OneDrive")
         if st.button("☁️ Export to OneDrive"):
