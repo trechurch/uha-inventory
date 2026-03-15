@@ -17,6 +17,7 @@ v4.0.0 — Added:
     'confidence' on every item in new_items / updates / fuzzy_matches
   - existing_descriptions loaded once per analyze run (no N+1 DB calls)
 """
+
 import difflib
 import chardet
 import pandas as pd
@@ -57,6 +58,8 @@ def detect_encoding(source) -> str:
 
     except Exception:
         return "utf-8"
+
+
 # -----------------------------------------------------------------------
 # NORMALIZERS  (from Production Power Query)
 # -----------------------------------------------------------------------
@@ -203,20 +206,6 @@ def fuzzy_match_description(
     """
     Find the closest existing item descriptions using difflib.
     Uses stdlib only — no extra dependencies.
-
-    Args:
-        description:           Incoming item description (will be uppercased).
-        existing_descriptions: Dict of {UPPER_DESCRIPTION: item_key}
-                               from db.get_all_descriptions().
-        threshold:             Minimum similarity ratio (0.0–1.0).
-                               Default 0.82 catches vendor typos / spacing
-                               differences without over-matching.
-        n:                     Max number of candidates to return.
-
-    Returns:
-        List of dicts sorted by score descending:
-        [{'description': str, 'key': str, 'score': int (0–100)}, ...]
-        Empty list if no match above threshold.
     """
     if not description or not existing_descriptions:
         return []
@@ -243,31 +232,14 @@ def score_import_row(
     key: str,
     item_data: Dict,
     match_type: str,          # 'exact', 'fuzzy', 'new'
-    fuzzy_score: int = 0,     # 0–100, only used when match_type='fuzzy'
+    fuzzy_score: int = 0,     # 0–100
 ) -> int:
-    """
-    Returns an integer confidence score (0–100) for an import row.
-
-    Scoring logic:
-      exact match  → starts at 100
-      fuzzy match  → starts at fuzzy_score (capped 60–90)
-      new item     → starts at 40
-
-    Bonuses (applied to all types):
-      +5   has a valid cost
-      +5   has a GL code
-      +5   has a vendor name
-      +3   has an item number
-
-    Penalties:
-      -10  description appears suspiciously short (< 4 chars)
-      -10  key contains '???' or placeholder text
-    """
+    """Returns an integer confidence score (0–100) for an import row."""
     if match_type == 'exact':
         base = 100
     elif match_type == 'fuzzy':
         base = max(60, min(90, fuzzy_score))
-    else:  # 'new'
+    else:
         base = 40
 
     bonus = 0
@@ -319,34 +291,18 @@ class InventoryImporter:
             self.errors.append(f"Read error: {e}")
             return None
 
-    # -- Analysis pass (preview, no DB writes) -------------------------
+    # -- Analysis pass -------------------------------------------------
     def analyze_import(self, df: pd.DataFrame) -> Dict:
-        """
-        Classifies every row into one of four buckets:
-          new_items     — clean new items, no DB match
-          updates       — exact key match against existing item
-          fuzzy_matches — no exact match but description is ~similar
-                          to an existing item; surfaced for user review
-          skipped       — metadata / substitution rows
-          errors        — rows that could not be processed
-
-        Every item in new_items, updates, and fuzzy_matches carries:
-          'confidence'  — integer 0–100 (see score_import_row)
-
-        fuzzy_matches items additionally carry:
-          'fuzzy_candidates' — list of closest existing items with scores
-        """
         analysis = {
             'total_rows':    len(df),
             'new_items':     [],
             'updates':       [],
-            'fuzzy_matches': [],   # ← new bucket
+            'fuzzy_matches': [],
             'skipped':       [],
             'errors':        [],
         }
 
-        # Load all existing descriptions once — prevents N+1 DB calls
-        # Falls back gracefully if db doesn't support the method yet
+        # Load all existing descriptions once
         try:
             existing_descriptions = self.db.get_all_descriptions()
         except Exception:
@@ -405,7 +361,6 @@ class InventoryImporter:
             )
 
             if fuzzy_candidates:
-                # Best fuzzy candidate drives the score
                 best_score = fuzzy_candidates[0]["score"]
                 confidence = score_import_row(
                     key, item_data, 'fuzzy', fuzzy_score=best_score
@@ -435,14 +390,7 @@ class InventoryImporter:
                        source_document: str = None,
                        doc_date: str = None,
                        include_fuzzy: bool = False) -> Dict:
-        """
-        Commits approved import rows to the database.
 
-        include_fuzzy=False (default): fuzzy_matches are NOT committed
-            automatically — they require explicit user approval first.
-        include_fuzzy=True: fuzzy matches are treated as new items
-            (use only when the user has reviewed and approved them).
-        """
         results = {
             'new_items_added':    0,
             'items_updated':      0,
@@ -485,10 +433,13 @@ class InventoryImporter:
     def import_file(self, filepath: str,
                     changed_by: str = "import",
                     auto_approve: bool = True) -> Tuple[Dict, Dict]:
+
         df = self.read_file(filepath)
         if df is None:
             return {'errors': self.errors}, {}
+
         analysis = self.analyze_import(df)
+
         if auto_approve:
             from pathlib import Path
             doc_date = datetime.now().strftime('%Y-%m-%d')
@@ -497,9 +448,10 @@ class InventoryImporter:
                 changed_by=changed_by,
                 source_document=Path(filepath).name,
                 doc_date=doc_date,
-                include_fuzzy=False   # fuzzy always requires manual review
+                include_fuzzy=False
             )
             return analysis, results
+
         return analysis, {}
 
     # -- Row prep ------------------------------------------------------
@@ -525,7 +477,7 @@ class InventoryImporter:
         if row.get('gtin'):
             item['gtin'] = str(row['gtin']).strip()
 
-        # GL field — may be "Produce 411085" combined
+        # GL field — may be "Produce 411085"
         gl_raw = row.get('gl_field') or row.get('gl_code') or ''
         if gl_raw:
             gl_name, gl_code = split_gl_field(str(gl_raw))
