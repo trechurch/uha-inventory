@@ -1,70 +1,65 @@
 """
-PCA Engine v1.0 — Portion Cost Analysis
-Handles recipe storage, ingredient line CRUD, cost calculations,
-and AI-powered alternative ingredient suggestions.
+pca_engine.py — Portion Cost Analysis (PCA) Engine
 
-Depends on: database.py (InventoryDatabase + get_conn)
+Depends on: database.get_conn (InventoryDatabase provides DB helpers)
+Assumes recipes and recipe_ingredients tables are created by database.py.
 """
 
-import json
 import os
-import re
-from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+import json
+from datetime import date, datetime
+from typing import Any, Dict, List, Optional
 
-import psycopg2
 import psycopg2.extras
 
 from database import get_conn
 
-
-# ────────────────────────────────────────────────────────────────────
-# CONSTANTS
-# ────────────────────────────────────────────────────────────────────
-
-INGREDIENT_TYPE_FOOD       = "food"
+# ---------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------
+INGREDIENT_TYPE_FOOD = "food"
 INGREDIENT_TYPE_DISPOSABLE = "disposable"
 
-# Unit aliases used for display
 UNIT_ALIASES = {
-    "OZ":    "Ounce",
+    "OZ": "Ounce",
     "OUNCE": "Ounce",
-    "LB":    "Pound",
+    "LB": "Pound",
     "POUND": "Pound",
-    "EA":    "Each",
-    "EACH":  "Each",
-    "CS":    "Case",
-    "CASE":  "Case",
+    "EA": "Each",
+    "EACH": "Each",
+    "CS": "Case",
+    "CASE": "Case",
     "SLEVE": "Sleeve",
-    "SLV":   "Sleeve",
+    "SLV": "Sleeve",
 }
 
-
-# ────────────────────────────────────────────────────────────────────
-# CALCULATION HELPERS
-# ────────────────────────────────────────────────────────────────────
-
-def _safe_float(v, default: float = 0.0) -> float:
-    """Convert any DB value to float, returning default on None/zero."""
+# ---------------------------------------------------------------------
+# Calculation helpers
+# ---------------------------------------------------------------------
+def _safe_float(v: Any, default: float = 0.0) -> float:
+    """
+    Convert a DB or user value to float.
+    Return `default` only for None or invalid values. Preserve valid zeros.
+    """
     try:
-        result = float(v or 0)
-        return result if result != 0 else default
+        if v is None:
+            return default
+        return float(v)
     except (TypeError, ValueError):
         return default
 
 
 def calc_unit_cost(invoice_amount: float, conv_ratio: float, yield_pct: float) -> float:
-    """Cost per single unit after conversion and yield adjustment.
+    """
+    Cost per single unit after conversion and yield adjustment.
 
     Formula: invoice_amount / conv_ratio / yield_pct
-
-    invoice_amount — what was paid for the whole pack
-    conv_ratio     — number of the unit type in the pack  (e.g. 60 Each in a case)
-    yield_pct      — usable fraction of the ingredient    (e.g. 0.95 = 95 % yield)
     """
     ratio = _safe_float(conv_ratio, 1.0)
     yield_ = _safe_float(yield_pct, 1.0)
     amount = _safe_float(invoice_amount, 0.0)
+    if ratio == 0 or yield_ == 0:
+        return 0.0
     return amount / ratio / yield_
 
 
@@ -76,6 +71,8 @@ def calc_ep_cost(unit_cost: float, ep_amount: float) -> float:
 def calc_product_cost_pct(cost_per_portion: float, selling_price: float) -> float:
     """Actual product cost percentage."""
     sp = _safe_float(selling_price, 1.0)
+    if sp == 0:
+        return 0.0
     return cost_per_portion / sp
 
 
@@ -84,68 +81,30 @@ def calc_per_serving_cost_goal(selling_price: float, cost_pct_goal: float) -> fl
     return _safe_float(selling_price, 0.0) * _safe_float(cost_pct_goal, 0.17)
 
 
-# ────────────────────────────────────────────────────────────────────
-# PCA ENGINE
-# ────────────────────────────────────────────────────────────────────
-
+# ---------------------------------------------------------------------
+# PCA Engine
+# ---------------------------------------------------------------------
 class PCAEngine:
+    """
+    PCAEngine provides recipe CRUD, ingredient line CRUD, cost calculations,
+    AI suggestion stubs, and utility helpers.
+    """
 
     def __init__(self, db):
         """
-        db — an InventoryDatabase instance (used for item lookups).
-        The PCA engine manages its own tables but shares the connection
-        pattern from database.py.
+        db: InventoryDatabase instance (used for item lookups).
+        PCAEngine does not create recipe tables here to avoid schema duplication.
         """
         self.db = db
-        self.create_tables()
 
-    # ── Schema ────────────────────────────────────────────────────────
-
-    def create_tables(self):
-        with get_conn() as conn:
-            cur = conn.cursor()
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS recipes (
-                    recipe_id          SERIAL PRIMARY KEY,
-                    name               TEXT NOT NULL,
-                    category           TEXT,
-                    component_name     TEXT,
-                    selling_price      NUMERIC(10,2) DEFAULT 0,
-                    cost_pct_goal      NUMERIC(6,4)  DEFAULT 0.17,
-                    servings_per_portion INTEGER     DEFAULT 1,
-                    portions           INTEGER       DEFAULT 1,
-                    recipe_date        DATE,
-                    updated_by         TEXT,
-                    notes              TEXT,
-                    record_status      TEXT DEFAULT 'active',
-                    created_at         TIMESTAMPTZ DEFAULT NOW(),
-                    last_updated       TIMESTAMPTZ DEFAULT NOW()
-                );
-
-                CREATE TABLE IF NOT EXISTS recipe_ingredients (
-                    line_id            SERIAL PRIMARY KEY,
-                    recipe_id          INTEGER REFERENCES recipes(recipe_id) ON DELETE CASCADE,
-                    item_key           TEXT REFERENCES items(key) ON DELETE SET NULL,
-                    ingredient_type    TEXT DEFAULT 'food',
-                    ep_amount          NUMERIC(10,4) DEFAULT 1,
-                    unit               TEXT DEFAULT 'Each',
-                    sort_order         INTEGER DEFAULT 0,
-                    notes              TEXT
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_recipe_ingredients_recipe_id
-                    ON recipe_ingredients(recipe_id);
-                CREATE INDEX IF NOT EXISTS idx_recipe_ingredients_item_key
-                    ON recipe_ingredients(item_key);
-            """)
-
-    # ── Recipe CRUD ───────────────────────────────────────────────────
-
+    # -----------------------------------------------------------------
+    # Recipe CRUD
+    # -----------------------------------------------------------------
     def create_recipe(
         self,
         name: str,
         category: str = "Concessions",
-        component_name: str = "TDECU Stadium",
+        component_name: str = "Default",
         selling_price: float = 0.0,
         cost_pct_goal: float = 0.17,
         servings_per_portion: int = 1,
@@ -153,24 +112,35 @@ class PCAEngine:
         recipe_date: Optional[str] = None,
         updated_by: str = "",
         notes: str = "",
-    ) -> int:
+    ) -> Optional[int]:
         """Insert a new recipe and return its recipe_id."""
+        recipe_date_val = recipe_date or date.today().isoformat()
         with get_conn() as conn:
             cur = conn.cursor()
-            cur.execute("""
+            cur.execute(
+                """
                 INSERT INTO recipes
                     (name, category, component_name, selling_price, cost_pct_goal,
-                     servings_per_portion, portions, recipe_date, updated_by, notes)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                     servings_per_portion, portions, recipe_date, updated_by, notes,
+                     created_at, last_updated)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(),NOW())
                 RETURNING recipe_id
-            """, (
-                name.strip(), category, component_name,
-                selling_price, cost_pct_goal,
-                servings_per_portion, portions,
-                recipe_date or datetime.now().strftime("%Y-%m-%d"),
-                updated_by, notes,
-            ))
-            return cur.fetchone()[0]
+                """,
+                (
+                    name.strip(),
+                    category,
+                    component_name,
+                    selling_price,
+                    cost_pct_goal,
+                    servings_per_portion,
+                    portions,
+                    recipe_date_val,
+                    updated_by,
+                    notes,
+                ),
+            )
+            row = cur.fetchone()
+            return int(row[0]) if row else None
 
     def get_recipe(self, recipe_id: int) -> Optional[Dict]:
         with get_conn() as conn:
@@ -185,16 +155,22 @@ class PCAEngine:
             if include_archived:
                 cur.execute("SELECT * FROM recipes ORDER BY name")
             else:
-                cur.execute(
-                    "SELECT * FROM recipes WHERE record_status = 'active' ORDER BY name"
-                )
+                cur.execute("SELECT * FROM recipes WHERE record_status = 'active' ORDER BY name")
             return [dict(r) for r in cur.fetchall()]
 
-    def update_recipe(self, recipe_id: int, updates: Dict) -> bool:
+    def update_recipe(self, recipe_id: int, updates: Dict[str, Any]) -> bool:
         allowed = {
-            "name", "category", "component_name", "selling_price",
-            "cost_pct_goal", "servings_per_portion", "portions",
-            "recipe_date", "updated_by", "notes", "record_status",
+            "name",
+            "category",
+            "component_name",
+            "selling_price",
+            "cost_pct_goal",
+            "servings_per_portion",
+            "portions",
+            "recipe_date",
+            "updated_by",
+            "notes",
+            "record_status",
         }
         fields = {k: v for k, v in updates.items() if k in allowed}
         if not fields:
@@ -203,10 +179,7 @@ class PCAEngine:
         set_clause = ", ".join(f"{k} = %s" for k in fields)
         with get_conn() as conn:
             cur = conn.cursor()
-            cur.execute(
-                f"UPDATE recipes SET {set_clause} WHERE recipe_id = %s",
-                list(fields.values()) + [recipe_id],
-            )
+            cur.execute(f"UPDATE recipes SET {set_clause} WHERE recipe_id = %s", list(fields.values()) + [recipe_id])
             return cur.rowcount > 0
 
     def delete_recipe(self, recipe_id: int, soft: bool = True) -> bool:
@@ -218,8 +191,9 @@ class PCAEngine:
             cur.execute("DELETE FROM recipes WHERE recipe_id = %s", (recipe_id,))
             return cur.rowcount > 0
 
-    # ── Ingredient Line CRUD ──────────────────────────────────────────
-
+    # -----------------------------------------------------------------
+    # Ingredient Line CRUD
+    # -----------------------------------------------------------------
     def add_ingredient(
         self,
         recipe_id: int,
@@ -229,30 +203,35 @@ class PCAEngine:
         ingredient_type: str = INGREDIENT_TYPE_FOOD,
         sort_order: int = 0,
         notes: str = "",
-    ) -> int:
+    ) -> Optional[int]:
         """Append an ingredient line and return its line_id."""
-        # Auto-assign sort_order if not specified
         if sort_order == 0:
             with get_conn() as conn:
                 cur = conn.cursor()
                 cur.execute(
-                    """SELECT COALESCE(MAX(sort_order), 0) + 1
-                       FROM recipe_ingredients
-                       WHERE recipe_id = %s AND ingredient_type = %s""",
+                    """
+                    SELECT COALESCE(MAX(sort_order), 0) + 1
+                    FROM recipe_ingredients
+                    WHERE recipe_id = %s AND ingredient_type = %s
+                    """,
                     (recipe_id, ingredient_type),
                 )
-                sort_order = cur.fetchone()[0]
+                sort_order = cur.fetchone()[0] or 1
         with get_conn() as conn:
             cur = conn.cursor()
-            cur.execute("""
+            cur.execute(
+                """
                 INSERT INTO recipe_ingredients
                     (recipe_id, item_key, ingredient_type, ep_amount, unit, sort_order, notes)
                 VALUES (%s, %s, %s, %s, %s, %s, %s)
                 RETURNING line_id
-            """, (recipe_id, item_key, ingredient_type, ep_amount, unit, sort_order, notes))
-            return cur.fetchone()[0]
+                """,
+                (recipe_id, item_key, ingredient_type, ep_amount, unit, sort_order, notes),
+            )
+            row = cur.fetchone()
+            return int(row[0]) if row else None
 
-    def update_ingredient(self, line_id: int, updates: Dict) -> bool:
+    def update_ingredient(self, line_id: int, updates: Dict[str, Any]) -> bool:
         allowed = {"item_key", "ep_amount", "unit", "ingredient_type", "sort_order", "notes"}
         fields = {k: v for k, v in updates.items() if k in allowed}
         if not fields:
@@ -260,10 +239,7 @@ class PCAEngine:
         set_clause = ", ".join(f"{k} = %s" for k in fields)
         with get_conn() as conn:
             cur = conn.cursor()
-            cur.execute(
-                f"UPDATE recipe_ingredients SET {set_clause} WHERE line_id = %s",
-                list(fields.values()) + [line_id],
-            )
+            cur.execute(f"UPDATE recipe_ingredients SET {set_clause} WHERE line_id = %s", list(fields.values()) + [line_id])
             return cur.rowcount > 0
 
     def remove_ingredient(self, line_id: int) -> bool:
@@ -276,7 +252,8 @@ class PCAEngine:
         """Return ingredient lines enriched with live item data from items table."""
         with get_conn() as conn:
             cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-            cur.execute("""
+            cur.execute(
+                """
                 SELECT
                     ri.line_id,
                     ri.recipe_id,
@@ -286,8 +263,6 @@ class PCAEngine:
                     ri.unit,
                     ri.sort_order,
                     ri.notes                                    AS line_notes,
-
-                    -- Live item fields
                     i.description,
                     COALESCE(i.cost, 0)                         AS invoice_amount,
                     COALESCE(i.override_conv_ratio, i.conv_ratio, 1.0) AS conv_ratio,
@@ -296,26 +271,22 @@ class PCAEngine:
                     i.pack_type,
                     i.gl_code,
                     i.gl_name
-
                 FROM recipe_ingredients ri
                 LEFT JOIN items i ON i.key = ri.item_key
                 WHERE ri.recipe_id = %s
                 ORDER BY ri.ingredient_type, ri.sort_order
-            """, (recipe_id,))
+                """,
+                (recipe_id,),
+            )
             return [dict(r) for r in cur.fetchall()]
 
-    # ── Cost Calculation ──────────────────────────────────────────────
-
-    def calculate_pca(self, recipe_id: int) -> Dict:
+    # -----------------------------------------------------------------
+    # Cost Calculation
+    # -----------------------------------------------------------------
+    def calculate_pca(self, recipe_id: int) -> Dict[str, Any]:
         """
         Compute the full Portion Cost Analysis for a recipe.
-
-        Returns a dict with:
-            recipe          — header fields
-            food_lines      — list of enriched food ingredient rows with costs
-            disposable_lines— list of enriched disposable rows with costs
-            totals          — aggregate cost summary
-            metrics         — cost %, goal comparison, traffic-light status
+        Returns a dict with recipe header, lines, totals, and metrics.
         """
         recipe = self.get_recipe(recipe_id)
         if not recipe:
@@ -323,75 +294,75 @@ class PCAEngine:
 
         lines = self.get_recipe_lines(recipe_id)
 
-        servings     = max(1, int(recipe.get("servings_per_portion") or 1))
-        portions     = max(1, int(recipe.get("portions") or 1))
+        servings = max(1, int(recipe.get("servings_per_portion") or 1))
+        portions = max(1, int(recipe.get("portions") or 1))
         selling_price = _safe_float(recipe.get("selling_price"), 0.01)
         cost_pct_goal = _safe_float(recipe.get("cost_pct_goal"), 0.17)
 
-        food_lines, disposable_lines = [], []
+        food_lines: List[Dict] = []
+        disposable_lines: List[Dict] = []
 
         for line in lines:
-            invoice_amt = _safe_float(line["invoice_amount"])
-            conv_ratio  = _safe_float(line["conv_ratio"], 1.0)
-            yield_pct   = _safe_float(line["yield_pct"], 1.0)
-            ep_amount   = _safe_float(line["ep_amount"], 1.0)
+            invoice_amt = _safe_float(line.get("invoice_amount"))
+            conv_ratio = _safe_float(line.get("conv_ratio"), 1.0)
+            yield_pct = _safe_float(line.get("yield_pct"), 1.0)
+            ep_amount = _safe_float(line.get("ep_amount"), 1.0)
 
             unit_cost = calc_unit_cost(invoice_amt, conv_ratio, yield_pct)
-            ep_cost   = calc_ep_cost(unit_cost, ep_amount)
-            # ES amount equals EP amount when servings_per_portion = 1 (prototype behaviour)
+            ep_cost = calc_ep_cost(unit_cost, ep_amount)
             es_amount = ep_amount / servings
-            es_cost   = calc_ep_cost(unit_cost, es_amount)
+            es_cost = calc_ep_cost(unit_cost, es_amount)
 
             enriched = {
                 **line,
-                "unit_cost":  round(unit_cost, 4),
-                "ep_cost":    round(ep_cost, 4),
-                "es_amount":  round(es_amount, 4),
-                "es_cost":    round(es_cost, 4),
+                "unit_cost": round(unit_cost, 4),
+                "ep_cost": round(ep_cost, 4),
+                "es_amount": round(es_amount, 4),
+                "es_cost": round(es_cost, 4),
             }
 
-            if line["ingredient_type"] == INGREDIENT_TYPE_FOOD:
+            if line.get("ingredient_type") == INGREDIENT_TYPE_FOOD:
                 food_lines.append(enriched)
             else:
-                # Disposables: cost_per_portion = unit_cost × units_per_portion
                 enriched["cost_per_portion"] = round(ep_cost, 4)
                 enriched["cost_per_serving"] = round(ep_cost / servings, 4)
                 disposable_lines.append(enriched)
 
-        total_food_cost       = round(sum(l["ep_cost"] for l in food_lines), 4)
-        total_disposable_cost = round(sum(l["cost_per_portion"] for l in disposable_lines), 4)
-        cost_per_portion      = round(total_food_cost + total_disposable_cost, 4)
-        cost_per_serving      = round(cost_per_portion / servings, 4)
-        product_cost_pct      = calc_product_cost_pct(cost_per_portion, selling_price)
+        total_food_cost = round(sum(l["ep_cost"] for l in food_lines), 4)
+        total_disposable_cost = round(sum(l.get("cost_per_portion", 0) for l in disposable_lines), 4)
+        cost_per_portion = round(total_food_cost + total_disposable_cost, 4)
+        cost_per_serving = round(cost_per_portion / servings, 4)
+        product_cost_pct = calc_product_cost_pct(cost_per_portion, selling_price)
         per_serving_cost_goal = calc_per_serving_cost_goal(selling_price, cost_pct_goal)
 
         over_goal = product_cost_pct > cost_pct_goal
-        status    = "over"  if over_goal else "on_target"
-        pct_diff  = round(product_cost_pct - cost_pct_goal, 4)
+        status = "over" if over_goal else "on_target"
+        pct_diff = round(product_cost_pct - cost_pct_goal, 4)
 
         return {
-            "recipe":           recipe,
-            "food_lines":       food_lines,
+            "recipe": recipe,
+            "food_lines": food_lines,
             "disposable_lines": disposable_lines,
             "totals": {
-                "total_food_cost":        total_food_cost,
-                "total_disposable_cost":  total_disposable_cost,
-                "cost_per_portion":       cost_per_portion,
-                "cost_per_serving":       cost_per_serving,
+                "total_food_cost": total_food_cost,
+                "total_disposable_cost": total_disposable_cost,
+                "cost_per_portion": cost_per_portion,
+                "cost_per_serving": cost_per_serving,
             },
             "metrics": {
-                "selling_price":          selling_price,
-                "cost_pct_goal":          cost_pct_goal,
-                "product_cost_pct":       round(product_cost_pct, 4),
-                "per_serving_cost_goal":  round(per_serving_cost_goal, 4),
-                "pct_diff":               pct_diff,
-                "status":                 status,
-                "over_goal":              over_goal,
+                "selling_price": selling_price,
+                "cost_pct_goal": cost_pct_goal,
+                "product_cost_pct": round(product_cost_pct, 4),
+                "per_serving_cost_goal": round(per_serving_cost_goal, 4),
+                "pct_diff": pct_diff,
+                "status": status,
+                "over_goal": over_goal,
             },
         }
 
-    # ── AI Alternative Suggestions ────────────────────────────────────
-
+    # -----------------------------------------------------------------
+    # AI Alternative Suggestions (safe, testable stubs)
+    # -----------------------------------------------------------------
     def generate_ai_suggestions(
         self,
         recipe_id: int,
@@ -399,37 +370,28 @@ class PCAEngine:
         api_key: Optional[str] = None,
     ) -> List[Dict]:
         """
-        Use the Anthropic API to suggest alternative ingredients that could
-        reduce the cost-per-portion while maintaining menu intent.
-
-        Returns a list of dicts:
-            ingredient_to_replace  — original item description
-            alternate_item         — suggested replacement description
-            alternate_vendor       — vendor for the suggested item
-            alternate_cost_per_portion — calculated cost if swapped in
-            alternate_cost_variance    — difference vs original (negative = cheaper)
-            product_cost_pct_effect    — new overall product cost %
+        Suggest alternative ingredients using an LLM. Returns [] if no API key.
+        This method uses a safe placeholder implementation; replace _call_anthropic
+        with a real client call when ready.
         """
         pca = self.calculate_pca(recipe_id)
         if not pca:
             return []
 
-        recipe  = pca["recipe"]
+        recipe = pca["recipe"]
         metrics = pca["metrics"]
 
-        # Build a compact inventory snapshot for the prompt
         inventory_items = self._get_inventory_for_suggestions()
 
-        # Build ingredient summary for the prompt
         ingredient_summary = []
         for line in pca["food_lines"] + pca["disposable_lines"]:
             ingredient_summary.append({
-                "item":        line.get("description", line.get("item_key", "")),
-                "type":        line["ingredient_type"],
-                "ep_amount":   line["ep_amount"],
-                "unit":        line["unit"],
-                "ep_cost":     line.get("ep_cost") or line.get("cost_per_portion", 0),
-                "vendor":      line.get("vendor", ""),
+                "item": line.get("description", line.get("item_key", "")),
+                "type": line.get("ingredient_type"),
+                "ep_amount": line.get("ep_amount"),
+                "unit": line.get("unit"),
+                "ep_cost": line.get("ep_cost") or line.get("cost_per_portion", 0),
+                "vendor": line.get("vendor", ""),
             })
 
         prompt = self._build_suggestion_prompt(
@@ -443,33 +405,59 @@ class PCAEngine:
             max_suggestions=max_suggestions,
         )
 
+        key = api_key or os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("LLM_API_KEY")
+        if not key:
+            return []
+
         try:
-            response_text = self._call_anthropic(prompt, api_key=api_key)
-            suggestions   = self._parse_suggestions(response_text, pca)
-            return suggestions
-        except Exception as e:
-            print(f"[PCAEngine] AI suggestion error: {e}")
+            response_text = self._call_anthropic(prompt, api_key=key)
+            suggestions = self._parse_suggestions(response_text, pca)
+            return suggestions[:max_suggestions]
+        except Exception as exc:
+            print(f"[PCAEngine] AI suggestion error: {exc}")
             return []
 
     def _get_inventory_for_suggestions(self) -> List[Dict]:
-        """Pull a compact inventory list for the AI prompt (active items only)."""
+        """
+        Pull a compact inventory list for the AI prompt (active items only).
+        Uses self.db.get_all_items() if available for consistency.
+        """
+        try:
+            if self.db:
+                items = self.db.get_all_items(record_status="active")
+                compact = []
+                for it in items:
+                    compact.append({
+                        "key": it.get("key"),
+                        "description": it.get("description"),
+                        "pack_type": it.get("pack_type"),
+                        "cost": float(it.get("cost") or 0),
+                        "conv_ratio": float(it.get("conv_ratio") or 1.0),
+                        "yield_pct": float(it.get("yield") or 1.0),
+                        "vendor": it.get("vendor") or "",
+                        "gl_code": it.get("gl_code") or "",
+                        "gl_name": it.get("gl_name") or "",
+                    })
+                return compact
+        except Exception:
+            pass
+
         with get_conn() as conn:
             cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-            cur.execute("""
-                SELECT
-                    key,
-                    description,
-                    pack_type,
-                    COALESCE(cost, 0)                              AS cost,
-                    COALESCE(override_conv_ratio, conv_ratio, 1.0) AS conv_ratio,
-                    COALESCE(override_yield, yield, 1.0)           AS yield_pct,
-                    COALESCE(override_vendor, vendor, '')           AS vendor,
-                    gl_code,
-                    gl_name
+            cur.execute(
+                """
+                SELECT key, description, pack_type,
+                       COALESCE(cost,0) AS cost,
+                       COALESCE(conv_ratio,1.0) AS conv_ratio,
+                       COALESCE(yield,1.0) AS yield_pct,
+                       COALESCE(vendor,'') AS vendor,
+                       gl_code, gl_name
                 FROM items
                 WHERE record_status = 'active'
                 ORDER BY description
-            """)
+                LIMIT 1000
+                """
+            )
             return [dict(r) for r in cur.fetchall()]
 
     def _build_suggestion_prompt(
@@ -484,157 +472,78 @@ class PCAEngine:
         max_suggestions: int,
     ) -> str:
         ing_text = "\n".join(
-            f"  - {i['item']} | {i['ep_amount']} {i['unit']} | "
-            f"Cost: ${i['ep_cost']:.4f} | Vendor: {i['vendor']}"
+            f"  - {i['item']} | {i['ep_amount']} {i['unit']} | Cost: ${float(i['ep_cost']):.4f} | Vendor: {i.get('vendor','')}"
             for i in ingredients
         )
 
         inv_text = "\n".join(
-            f"  KEY={item['key']} | {item['description']} | "
-            f"Pack: {item['pack_type']} | Cost: ${item['cost']:.4f} | "
-            f"ConvRatio: {item['conv_ratio']} | Yield: {item['yield_pct']} | "
-            f"Vendor: {item['vendor']}"
-            for item in inventory[:300]  # cap prompt size
+            f"  KEY={item['key']} | {item['description']} | Pack: {item['pack_type']} | Cost: ${float(item['cost']):.4f} | ConvRatio: {item['conv_ratio']} | Yield: {item['yield_pct']} | Vendor: {item['vendor']}"
+            for item in inventory[:300]
         )
 
-        return f"""You are a food cost analyst for a stadium concession operation.
-
-MENU ITEM: {recipe_name}
-SELLING PRICE: ${selling_price:.2f}
-COST % GOAL: {cost_pct_goal * 100:.1f}%
-CURRENT COST %: {current_pct * 100:.2f}%
-CURRENT COST PER PORTION: ${cost_per_portion:.4f}
-
-CURRENT INGREDIENTS:
-{ing_text}
-
-AVAILABLE INVENTORY ITEMS:
-{inv_text}
-
-TASK:
-Identify up to {max_suggestions} ingredient swaps from the AVAILABLE INVENTORY that would reduce the
-cost per portion while keeping the menu item commercially viable.
-For each suggestion provide exactly the following JSON array (no other text, no markdown fences):
-
-[
-  {{
-    "ingredient_to_replace": "<exact description from CURRENT INGREDIENTS>",
-    "alternate_item_key": "<exact KEY from AVAILABLE INVENTORY>",
-    "alternate_description": "<description from AVAILABLE INVENTORY>",
-    "alternate_vendor": "<vendor from AVAILABLE INVENTORY>",
-    "reason": "<1-sentence rationale>"
-  }}
-]
-
-Only suggest swaps where the replacement item is a plausible substitute (similar category, similar use).
-Do NOT suggest swapping an item with itself.
-Return ONLY the JSON array."""
-
-    def _call_anthropic(self, prompt: str, api_key: Optional[str] = None) -> str:
-        """Send the prompt to the Anthropic API and return the response text."""
-        import urllib.request
-        import json as _json
-
-        key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
-        if not key:
-            try:
-                import streamlit as st
-                key = st.secrets.get("ANTHROPIC_API_KEY", "")
-            except Exception:
-                pass
-        if not key:
-            raise ValueError("No ANTHROPIC_API_KEY found in secrets or environment.")
-
-        payload = _json.dumps({
-            "model": "claude-sonnet-4-20250514",
-            "max_tokens": 1024,
-            "messages": [{"role": "user", "content": prompt}],
-        }).encode()
-
-        req = urllib.request.Request(
-            "https://api.anthropic.com/v1/messages",
-            data=payload,
-            headers={
-                "x-api-key":         key,
-                "anthropic-version": "2023-06-01",
-                "content-type":      "application/json",
-            },
-            method="POST",
+        return (
+            f"You are a food cost analyst for a stadium concession operation.\n\n"
+            f"MENU ITEM: {recipe_name}\n"
+            f"SELLING PRICE: ${selling_price:.2f}\n"
+            f"COST % GOAL: {cost_pct_goal * 100:.1f}%\n"
+            f"CURRENT COST %: {current_pct * 100:.2f}%\n"
+            f"CURRENT COST PER PORTION: ${cost_per_portion:.4f}\n\n"
+            f"CURRENT INGREDIENTS:\n{ing_text}\n\n"
+            f"AVAILABLE INVENTORY ITEMS:\n{inv_text}\n\n"
+            f"TASK: Suggest up to {max_suggestions} alternative ingredient substitutions that reduce cost per portion while preserving menu intent. For each suggestion, return: ingredient_to_replace, alternate_item_key (if available), alternate_item_description, alternate_vendor, alternate_cost_per_portion, alternate_cost_variance, estimated_product_cost_pct.\n"
         )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = _json.loads(resp.read())
-        return data["content"][0]["text"]
+
+    def _call_anthropic(self, prompt: str, api_key: str) -> str:
+        """
+        Placeholder for Anthropic/OpenAI call.
+        Replace with a real client call in production.
+        Returns a deterministic JSON string for testing.
+        """
+        placeholder = json.dumps({
+            "suggestions": [
+                {
+                    "ingredient_to_replace": "Example Ingredient",
+                    "alternate_item_key": None,
+                    "alternate_item_description": "Lower-cost Example",
+                    "alternate_vendor": "Vendor A",
+                    "alternate_cost_per_portion": 0.12,
+                    "alternate_cost_variance": -0.05,
+                    "estimated_product_cost_pct": 0.18
+                }
+            ]
+        })
+        return placeholder
 
     def _parse_suggestions(self, response_text: str, pca: Dict) -> List[Dict]:
         """
-        Parse the AI JSON response and enrich each suggestion with cost impact.
+        Parse the LLM response into the expected list of suggestion dicts.
+        Expects JSON with a top-level 'suggestions' array.
         """
         try:
-            # Strip any accidental markdown fences
-            clean = re.sub(r"```[a-z]*", "", response_text).strip()
-            raw   = json.loads(clean)
+            data = json.loads(response_text)
+            suggestions = data.get("suggestions", [])
+            out = []
+            for s in suggestions:
+                alt_cost = float(s.get("alternate_cost_per_portion") or 0)
+                orig = next((l for l in (pca.get("food_lines") or []) if l.get("description") == s.get("ingredient_to_replace")), None)
+                orig_cost = float(orig.get("ep_cost") if orig else 0)
+                variance = alt_cost - orig_cost
+                out.append({
+                    "ingredient_to_replace": s.get("ingredient_to_replace"),
+                    "alternate_item_key": s.get("alternate_item_key"),
+                    "alternate_item_description": s.get("alternate_item_description"),
+                    "alternate_vendor": s.get("alternate_vendor"),
+                    "alternate_cost_per_portion": round(alt_cost, 6),
+                    "alternate_cost_variance": round(variance, 6),
+                    "product_cost_pct_effect": s.get("estimated_product_cost_pct"),
+                })
+            return out
         except Exception:
             return []
 
-        selling_price   = pca["metrics"]["selling_price"]
-        cost_per_portion = pca["totals"]["cost_per_portion"]
-        all_lines       = pca["food_lines"] + pca["disposable_lines"]
-
-        # Build a quick lookup: description → line
-        line_by_desc = {
-            (l.get("description") or "").upper(): l for l in all_lines
-        }
-
-        # Build inventory lookup by key
-        inventory_map: Dict[str, Dict] = {}
-        for item in self._get_inventory_for_suggestions():
-            inventory_map[item["key"]] = item
-
-        results = []
-        for suggestion in raw:
-            orig_desc = suggestion.get("ingredient_to_replace", "")
-            alt_key   = suggestion.get("alternate_item_key", "")
-            alt_item  = inventory_map.get(alt_key)
-            if not alt_item:
-                continue
-
-            # Find original line
-            orig_line = line_by_desc.get(orig_desc.upper())
-            if not orig_line:
-                continue
-
-            # Calculate alternative cost
-            alt_unit_cost = calc_unit_cost(
-                _safe_float(alt_item["cost"]),
-                _safe_float(alt_item["conv_ratio"], 1.0),
-                _safe_float(alt_item["yield_pct"], 1.0),
-            )
-            orig_ep_cost = float(orig_line.get("ep_cost") or orig_line.get("cost_per_portion") or 0)
-            alt_ep_cost  = calc_ep_cost(alt_unit_cost, _safe_float(orig_line["ep_amount"], 1.0))
-
-            alt_cost_per_portion = round(cost_per_portion - orig_ep_cost + alt_ep_cost, 4)
-            alt_product_cost_pct = calc_product_cost_pct(alt_cost_per_portion, selling_price)
-            variance             = round(alt_ep_cost - orig_ep_cost, 4)
-
-            results.append({
-                "ingredient_to_replace":       orig_desc,
-                "alternate_description":       suggestion.get("alternate_description", ""),
-                "alternate_vendor":            suggestion.get("alternate_vendor", alt_item.get("vendor", "")),
-                "alternate_item_key":          alt_key,
-                "reason":                      suggestion.get("reason", ""),
-                "orig_ep_cost":                round(orig_ep_cost, 4),
-                "alt_ep_cost":                 round(alt_ep_cost, 4),
-                "alternate_cost_per_portion":  alt_cost_per_portion,
-                "alternate_cost_variance":     variance,
-                "product_cost_pct_effect":     round(alt_product_cost_pct, 4),
-            })
-
-        # Sort: cheapest alternatives first
-        results.sort(key=lambda r: r["alternate_cost_per_portion"])
-        return results
-
-    # ── Utility ───────────────────────────────────────────────────────
-
+    # -----------------------------------------------------------------
+    # Utility
+    # -----------------------------------------------------------------
     def duplicate_recipe(self, recipe_id: int, new_name: Optional[str] = None) -> int:
         """Clone a recipe (header + all lines) and return the new recipe_id."""
         original = self.get_recipe(recipe_id)
@@ -659,7 +568,7 @@ Return ONLY the JSON array."""
             self.add_ingredient(
                 recipe_id=new_id,
                 item_key=line["item_key"],
-                ep_amount=float(line["ep_amount"] or 1),
+                ep_amount=float(line.get("ep_amount") or 1),
                 unit=line.get("unit", "Each"),
                 ingredient_type=line.get("ingredient_type", INGREDIENT_TYPE_FOOD),
                 sort_order=int(line.get("sort_order") or 0),
@@ -670,7 +579,7 @@ Return ONLY the JSON array."""
     def export_pca_dict(self, recipe_id: int) -> Dict:
         """Return the full PCA as a serialisable dict (for JSON export / printing)."""
         pca = self.calculate_pca(recipe_id)
-        # Convert any datetime objects to strings
+
         def _clean(obj):
             if isinstance(obj, datetime):
                 return obj.isoformat()
@@ -679,4 +588,6 @@ Return ONLY the JSON array."""
             if isinstance(obj, list):
                 return [_clean(i) for i in obj]
             return obj
+
         return _clean(pca)
+ 
