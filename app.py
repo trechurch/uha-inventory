@@ -2,16 +2,16 @@
 UHA Inventory Management System — Streamlit Web App
 Streamlit Community Cloud deployment
 
-v4.1.0 — Fixed top nav bar: truly viewport-fixed, correct design-token colors,
-          compact dropdowns, View > Toggle Top Nav, sidebar nav bar toggle.
+v4.2.0 — Top nav injected via st.components.v1.html + window.parent so it
+          renders as real HTML/CSS at the viewport level, not as escaped text.
+          Design tokens, toggle, and menu structure all per spec.
 """
 
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 import io
-import time
 from datetime import datetime
-from typing import Optional
 from pathlib import Path
 
 # ── Page config (must be first Streamlit call) ──────────────────────────────
@@ -28,11 +28,10 @@ from importer import InventoryImporter
 from gl_manager import GLCodeManager
 import onedrive_connector as od
 
-# ── Version ──────────────────────────────────────────────────────────────────
-__version__ = "4.1.0"
+__version__ = "4.2.0"
 
 # ────────────────────────────────────────────────────────────────────────────
-# SESSION STATE HELPERS
+# SESSION STATE
 # ────────────────────────────────────────────────────────────────────────────
 
 @st.cache_resource
@@ -46,16 +45,15 @@ def get_gl():
     return GLCodeManager(get_db())
 
 def _init_session():
-    """Initialise all session-state defaults on first run."""
     defaults = {
-        "current_page":  "🏠 Dashboard",
-        "show_top_nav":  True,
+        "current_page": "🏠 Dashboard",
+        "show_top_nav": True,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
 
-# ── end of session state helpers ─────────────────────────────────────────────
+# ── end of session state ─────────────────────────────────────────────────────
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -63,28 +61,22 @@ def _init_session():
 # ────────────────────────────────────────────────────────────────────────────
 
 _PAGE_MAP = {
-    "dashboard":    "🏠 Dashboard",
-    "inventory":    "📦 Inventory",
-    "import":       "📥 Import",
-    "gl_codes":     "🏷️ GL Codes",
-    "history":      "📜 History",
-    "export":       "📤 Export",
-    "pca":          "🧪 PCA",
-    "app_mgmt":     "⚙️ App Management",
+    "dashboard": "🏠 Dashboard",
+    "inventory": "📦 Inventory",
+    "import":    "📥 Import",
+    "gl_codes":  "🏷️ GL Codes",
+    "history":   "📜 History",
+    "export":    "📤 Export",
+    "pca":       "🧪 PCA",
+    "app_mgmt":  "⚙️ App Management",
 }
 
 def _handle_query_params():
-    """
-    Handle ?page=<key> and ?toggle_nav=1 before rendering.
-    Both fire a rerun so the rest of the frame is clean.
-    """
     params = st.query_params
-
     if "toggle_nav" in params:
         st.session_state.show_top_nav = not st.session_state.show_top_nav
         st.query_params.clear()
         st.rerun()
-
     if "page" in params:
         key = params["page"]
         if key in _PAGE_MAP:
@@ -96,309 +88,209 @@ def _handle_query_params():
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# TOP NAV — CSS + HTML INJECTION
+# TOP NAV — injected via st.components.v1.html → window.parent
 # ────────────────────────────────────────────────────────────────────────────
 
-_NAV_HEIGHT_PX = 38          # height of the injected nav bar
-_STREAMLIT_HEADER_SEL = "header[data-testid='stHeader']"
+# CSS injected into window.parent.document.head each render
+_NAV_CSS = """
+:root {
+  --color-bg-primary:    #FFFFFF;
+  --color-bg-secondary:  #F5F6F8;
+  --color-bg-tertiary:   #E9EBEF;
+  --color-surface:       #FFFFFF;
+  --color-border:        #D0D3D9;
+  --color-border-strong: #A8ACB3;
+  --color-text-primary:  #1A1C1F;
+  --color-text-secondary:#4A4E55;
+  --color-text-tertiary: #6E737A;
+  --color-accent:        #0066CC;
+  --color-accent-hover:  #0052A3;
+  --color-accent-muted:  #CCE0F5;
+  --font-base:           "Inter","Segoe UI",system-ui,sans-serif;
+  --font-xs:             11px;
+  --font-sm:             13px;
+  --nav-h:               38px;
+}
+header[data-testid="stHeader"] { display:none !important; }
+.main .block-container { padding-top: calc(var(--nav-h) + 18px) !important; }
+section[data-testid="stSidebar"] > div:first-child { padding-top: var(--nav-h) !important; }
 
-_NAV_CSS = f"""
-<style>
-  /* ── Design Tokens ─────────────────────────────────────────────────────── */
-  :root {{
-    --color-bg-primary:    #FFFFFF;
-    --color-bg-secondary:  #F5F6F8;
-    --color-bg-tertiary:   #E9EBEF;
-    --color-surface:       #FFFFFF;
-    --color-border:        #D0D3D9;
-    --color-border-strong: #A8ACB3;
-    --color-text-primary:  #1A1C1F;
-    --color-text-secondary:#4A4E55;
-    --color-text-tertiary: #6E737A;
-    --color-accent:        #0066CC;
-    --color-accent-hover:  #0052A3;
-    --color-accent-muted:  #CCE0F5;
-    --color-danger:        #D64545;
-    --color-warning:       #E6A100;
-    --color-success:       #2F8F4E;
-    --font-base:           "Inter", "Segoe UI", system-ui, sans-serif;
-    --font-size-xs:        11px;
-    --font-size-sm:        13px;
-    --font-size-md:        15px;
-    --nav-h:               {_NAV_HEIGHT_PX}px;
-  }}
-
-  /* ── Hide Streamlit's own header so we own the full top ──────────────── */
-  {_STREAMLIT_HEADER_SEL} {{
-    display: none !important;
-  }}
-
-  /* ── Push Streamlit main content down below our nav ──────────────────── */
-  .main .block-container {{
-    padding-top: calc(var(--nav-h) + 16px) !important;
-  }}
-  section[data-testid="stSidebar"] > div:first-child {{
-    padding-top: var(--nav-h) !important;
-  }}
-
-  /* ── Nav bar root ────────────────────────────────────────────────────── */
-  #uha-topnav {{
-    position:   fixed;
-    top:        0;
-    left:       0;
-    right:      0;
-    height:     var(--nav-h);
-    background: var(--color-bg-primary);
-    border-bottom: 1px solid var(--color-border);
-    display:    flex;
-    align-items: center;
-    gap:        0;
-    z-index:    999999;
-    font-family: var(--font-base);
-    font-size:  var(--font-size-sm);
-    user-select: none;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.06);
-  }}
-
-  /* ── App wordmark ────────────────────────────────────────────────────── */
-  #uha-topnav .uha-brand {{
-    display:     flex;
-    align-items: center;
-    gap:         6px;
-    padding:     0 12px 0 14px;
-    color:       var(--color-accent);
-    font-size:   var(--font-size-sm);
-    font-weight: 700;
-    letter-spacing: 0.03em;
-    white-space: nowrap;
-    border-right: 1px solid var(--color-border);
-    height:      100%;
-  }}
-  #uha-topnav .uha-brand span {{
-    color: var(--color-text-secondary);
-    font-weight: 400;
-  }}
-
-  /* ── Each top-level menu ─────────────────────────────────────────────── */
-  #uha-topnav .uha-menu {{
-    position: relative;
-    height:   100%;
-    display:  flex;
-    align-items: center;
-  }}
-
-  /* ── Top-level trigger button ────────────────────────────────────────── */
-  #uha-topnav .uha-trigger {{
-    display:     flex;
-    align-items: center;
-    gap:         3px;
-    padding:     0 10px;
-    height:      100%;
-    cursor:      pointer;
-    color:       var(--color-text-primary);
-    font-weight: 500;
-    font-size:   var(--font-size-sm);
-    white-space: nowrap;
-    border:      none;
-    background:  none;
-    outline:     none;
-    text-decoration: none;
-  }}
-  #uha-topnav .uha-trigger:hover,
-  #uha-topnav .uha-menu:hover .uha-trigger {{
-    background: var(--color-accent-muted);
-    color:      var(--color-accent);
-  }}
-  #uha-topnav .uha-trigger .uha-caret {{
-    font-size: 8px;
-    opacity:   0.5;
-    margin-top: 1px;
-  }}
-
-  /* ── Dropdown panel ──────────────────────────────────────────────────── */
-  #uha-topnav .uha-dropdown {{
-    display:   none;
-    position:  absolute;
-    top:       calc(var(--nav-h) - 1px);
-    left:      0;
-    min-width: 196px;
-    background: var(--color-surface);
-    border:    1px solid var(--color-border);
-    border-top: none;
-    border-radius: 0 0 6px 6px;
-    box-shadow: 0 6px 16px rgba(0,0,0,0.10);
-    z-index:   1000000;
-    padding:   4px 0;
-  }}
-  #uha-topnav .uha-menu:hover .uha-dropdown {{
-    display: block;
-  }}
-
-  /* ── Dropdown item ───────────────────────────────────────────────────── */
-  #uha-topnav .uha-dropdown a,
-  #uha-topnav .uha-dropdown .uha-drop-item {{
-    display:     flex;
-    align-items: center;
-    gap:         8px;
-    padding:     5px 14px;
-    color:       var(--color-text-primary);
-    font-size:   var(--font-size-sm);
-    font-weight: 400;
-    text-decoration: none;
-    white-space: nowrap;
-    cursor:      pointer;
-    line-height: 1.3;
-  }}
-  #uha-topnav .uha-dropdown a:hover,
-  #uha-topnav .uha-dropdown .uha-drop-item:hover {{
-    background: var(--color-accent-muted);
-    color:      var(--color-accent);
-  }}
-
-  /* ── Shortcut hint (right-aligned) ──────────────────────────────────── */
-  #uha-topnav .uha-hint {{
-    margin-left: auto;
-    font-size:   var(--font-size-xs);
-    color:       var(--color-text-tertiary);
-    padding-left: 20px;
-  }}
-
-  /* ── Separator ───────────────────────────────────────────────────────── */
-  #uha-topnav .uha-sep {{
-    height:  1px;
-    background: var(--color-border);
-    margin:  4px 10px;
-  }}
-
-  /* ── Nav icon (small emoji / symbol) ────────────────────────────────── */
-  #uha-topnav .uha-ico {{
-    width:   16px;
-    text-align: center;
-    font-size: 13px;
-    flex-shrink: 0;
-  }}
-
-  /* ── Right-side spacer ───────────────────────────────────────────────── */
-  #uha-topnav .uha-spacer {{
-    flex: 1;
-  }}
-
-  /* ── Version badge ───────────────────────────────────────────────────── */
-  #uha-topnav .uha-ver {{
-    padding:   0 14px;
-    font-size: var(--font-size-xs);
-    color:     var(--color-text-tertiary);
-  }}
-</style>
+#uha-topnav {
+  position:fixed; top:0; left:0; right:0;
+  height:var(--nav-h);
+  background:var(--color-bg-primary);
+  border-bottom:1px solid var(--color-border);
+  display:flex; align-items:center;
+  z-index:999999;
+  font-family:var(--font-base);
+  font-size:var(--font-sm);
+  user-select:none;
+  box-shadow:0 1px 3px rgba(0,0,0,.06);
+}
+#uha-topnav .uha-brand {
+  display:flex; align-items:center; gap:5px;
+  padding:0 12px 0 14px; height:100%;
+  border-right:1px solid var(--color-border);
+  color:var(--color-accent);
+  font-weight:700; font-size:var(--font-sm);
+  white-space:nowrap; letter-spacing:.03em;
+}
+#uha-topnav .uha-brand span { color:var(--color-text-secondary); font-weight:400; }
+#uha-topnav .uha-menu { position:relative; height:100%; display:flex; align-items:center; }
+#uha-topnav .uha-trigger {
+  display:flex; align-items:center; gap:3px;
+  padding:0 10px; height:100%;
+  cursor:pointer; color:var(--color-text-primary);
+  font-weight:500; font-size:var(--font-sm); white-space:nowrap;
+  border:none; background:none; outline:none; text-decoration:none;
+}
+#uha-topnav .uha-trigger:hover,
+#uha-topnav .uha-menu:hover > .uha-trigger {
+  background:var(--color-accent-muted); color:var(--color-accent);
+}
+#uha-topnav .uha-caret { font-size:8px; opacity:.5; margin-top:1px; }
+#uha-topnav .uha-dropdown {
+  display:none; position:absolute;
+  top:calc(var(--nav-h) - 1px); left:0;
+  min-width:196px; background:var(--color-surface);
+  border:1px solid var(--color-border); border-top:none;
+  border-radius:0 0 6px 6px;
+  box-shadow:0 6px 16px rgba(0,0,0,.10);
+  z-index:1000000; padding:4px 0;
+}
+#uha-topnav .uha-menu:hover > .uha-dropdown { display:block; }
+#uha-topnav .uha-dropdown a {
+  display:flex; align-items:center; gap:8px;
+  padding:5px 14px;
+  color:var(--color-text-primary);
+  font-size:var(--font-sm); font-weight:400;
+  text-decoration:none; white-space:nowrap; cursor:pointer; line-height:1.3;
+}
+#uha-topnav .uha-dropdown a:hover { background:var(--color-accent-muted); color:var(--color-accent); }
+#uha-topnav .uha-hint { margin-left:auto; font-size:var(--font-xs); color:var(--color-text-tertiary); padding-left:20px; }
+#uha-topnav .uha-sep { height:1px; background:var(--color-border); margin:4px 10px; }
+#uha-topnav .uha-ico { width:16px; text-align:center; font-size:13px; flex-shrink:0; }
+#uha-topnav .uha-spacer { flex:1; }
+#uha-topnav .uha-ver { padding:0 14px; font-size:var(--font-xs); color:var(--color-text-tertiary); }
 """
 
-def _nav_item(icon: str, label: str, href: str = "#", hint: str = "") -> str:
-    """Render a single dropdown anchor item."""
-    hint_html = f'<span class="uha-hint">{hint}</span>' if hint else ""
-    return (
-        f'<a href="{href}">'
-        f'  <span class="uha-ico">{icon}</span>'
-        f'  {label}'
-        f'  {hint_html}'
-        f'</a>'
-    )
+_HIDDEN_CSS = """
+header[data-testid="stHeader"] { display:none !important; }
+.main .block-container { padding-top: 16px !important; }
+section[data-testid="stSidebar"] > div:first-child { padding-top: 0 !important; }
+"""
+
+
+def _item(ico: str, label: str, href: str = "#", hint: str = "") -> str:
+    h = f'<span class="uha-hint">{hint}</span>' if hint else ""
+    return f'<a href="{href}"><span class="uha-ico">{ico}</span>{label}{h}</a>'
 
 def _sep() -> str:
     return '<div class="uha-sep"></div>'
 
+def _menu(trigger: str, *rows: str) -> str:
+    inner = "".join(rows)
+    return (
+        f'<div class="uha-menu">'
+        f'<div class="uha-trigger">{trigger} <span class="uha-caret">&#9662;</span></div>'
+        f'<div class="uha-dropdown">{inner}</div>'
+        f'</div>'
+    )
+
+
+def _build_nav_html(ver: str) -> str:
+    file_m = _menu("File",
+        _item("&#x1F5CB;", "New Tab",    "javascript:window.open(window.location.href,'_blank');", "T"),
+        _item("&#x2B1C;",  "New Window", "javascript:window.open(window.location.href,'_blank','width=1400,height=900');", "W"),
+        _sep(),
+        _item("&#x1F5A8;", "Print",  "javascript:window.print();", "P"),
+        _item("&#x2197;",  "Share",  "javascript:(function(){if(navigator.share){navigator.share({title:'UHA Inventory',url:window.location.href})}else{navigator.clipboard.writeText(window.location.href);alert('Link copied')}})();", "S"),
+        _item("&#x1F4E4;", "Export", "?page=export", "E"),
+        _sep(),
+        _item("&#x2715;",  "Close Tab",   "javascript:window.close();", "C"),
+        _item("&#x23FB;",  "Exit Window", "javascript:if(confirm('Close UHA Inventory?'))window.close();", "X"),
+    )
+    dash_m = _menu("Dashboards",
+        _item("&#x1F3E0;", "Database Dashboard",  "?page=dashboard", "D"),
+        _item("&#x1F4E6;", "Inventory Dashboard", "?page=inventory", "I"),
+        _item("&#x1F9EA;", "PCA Dashboard",       "?page=pca",       "P"),
+        _item("&#x1F4E5;", "Import Dashboard",    "?page=import",    "M"),
+        _item("&#x2699;",  "App Management",      "?page=app_mgmt",  "A"),
+    )
+    view_m = _menu("View",
+        _item("&#x1F50D;", "Zoom",        "javascript:void(0);", "Z"),
+        _item("&#x26F6;",  "Full Screen", "javascript:document.documentElement.requestFullscreen&&document.documentElement.requestFullscreen();", "F"),
+        _item("&#x1F3A8;", "Style",       "javascript:void(0);", "S"),
+        _sep(),
+        _item("&#x2630;",  "Toggle Top Nav", "?toggle_nav=1"),
+    )
+    help_m = _menu("Help",
+        _item("&#x2139;",  "About",       "javascript:void(0);", "B"),
+        _item("&#x1F195;", "What's New",  "javascript:void(0);", "N"),
+        _item("&#x2753;",  "Help Center", "javascript:void(0);", "H"),
+        _item("&#x26A0;",  "Report Issue","javascript:void(0);", "I"),
+    )
+    return (
+        f'<div id="uha-topnav">'
+        f'<div class="uha-brand">&#x1F3DF;&#xFE0F;&nbsp;<span>UHA IMS</span></div>'
+        f'{file_m}{dash_m}{view_m}{help_m}'
+        f'<div class="uha-spacer"></div>'
+        f'<div class="uha-ver">v{ver}</div>'
+        f'</div>'
+    )
+
+
 def render_top_nav():
     """
-    Inject the fixed top navigation bar.
-    Controlled by st.session_state.show_top_nav.
-    Returns immediately (no nav rendered) when hidden.
+    Inject the fixed top nav into window.parent (the actual Streamlit page).
+    st.components.v1.html runs in an iframe; we reach out via window.parent
+    to write the nav bar and its CSS into the real document.
+    height=0 keeps the iframe invisible.
     """
-    # Always inject base CSS so layout padding is reset correctly
-    if not st.session_state.get("show_top_nav", True):
-        # When hidden, remove the nav-height padding offsets
-        st.markdown("""
-        <style>
-          header[data-testid="stHeader"] { display: none !important; }
-          .main .block-container { padding-top: 16px !important; }
-          section[data-testid="stSidebar"] > div:first-child { padding-top: 0 !important; }
-        </style>
-        """, unsafe_allow_html=True)
-        return
+    show = st.session_state.get("show_top_nav", True)
 
-    # ── File menu ────────────────────────────────────────────────────────────
-    file_menu = f"""
-    <div class="uha-menu">
-      <div class="uha-trigger">File <span class="uha-caret">▾</span></div>
-      <div class="uha-dropdown">
-        {_nav_item("🗋", "New Tab",      "javascript:window.open(window.location.href,'_blank');", "T")}
-        {_nav_item("⬜", "New Window",   "javascript:window.open(window.location.href,'_blank','width=1400,height=900');", "W")}
-        {_sep()}
-        {_nav_item("🖨", "Print",        "javascript:window.print();",                            "P")}
-        {_nav_item("↗", "Share",         "javascript:(function(){{if(navigator.share){{navigator.share({{title:'UHA Inventory',url:window.location.href}})}}else{{navigator.clipboard.writeText(window.location.href);alert('Link copied')}}}})();", "S")}
-        {_nav_item("📤", "Export",       "?page=export",                                          "E")}
-        {_sep()}
-        {_nav_item("✕", "Close Tab",     "javascript:window.close();",                            "C")}
-        {_nav_item("⏻", "Exit Window",  "javascript:if(confirm('Close UHA Inventory?'))window.close();", "X")}
-      </div>
-    </div>
-    """
+    if show:
+        css_block = _NAV_CSS
+        nav_html  = _build_nav_html(__version__)
+    else:
+        css_block = _HIDDEN_CSS
+        nav_html  = ""
 
-    # ── Dashboards menu ──────────────────────────────────────────────────────
-    dash_menu = f"""
-    <div class="uha-menu">
-      <div class="uha-trigger">Dashboards <span class="uha-caret">▾</span></div>
-      <div class="uha-dropdown">
-        {_nav_item("🏠", "Database Dashboard",    "?page=dashboard",  "D")}
-        {_nav_item("📦", "Inventory Dashboard",   "?page=inventory",  "I")}
-        {_nav_item("🧪", "PCA Dashboard",         "?page=pca",        "P")}
-        {_nav_item("📥", "Import Dashboard",      "?page=import",     "M")}
-        {_nav_item("⚙️", "App Management",        "?page=app_mgmt",   "A")}
-      </div>
-    </div>
-    """
+    # Escape backticks so the template literals don't break
+    css_safe = css_block.replace("\\", "\\\\").replace("`", "\\`")
+    nav_safe  = nav_html.replace("\\", "\\\\").replace("`", "\\`")
 
-    # ── View menu ────────────────────────────────────────────────────────────
-    view_menu = f"""
-    <div class="uha-menu">
-      <div class="uha-trigger">View <span class="uha-caret">▾</span></div>
-      <div class="uha-dropdown">
-        {_nav_item("🔍", "Zoom",        "javascript:void(0);",             "Z")}
-        {_nav_item("⛶",  "Full Screen", "javascript:document.documentElement.requestFullscreen?.();", "F")}
-        {_nav_item("🎨", "Style",       "javascript:void(0);",             "S")}
-        {_sep()}
-        {_nav_item("☰",  "Toggle Top Nav", "?toggle_nav=1")}
-      </div>
-    </div>
-    """
+    script = f"""
+<script>
+(function() {{
+  var doc = window.parent.document;
 
-    # ── Help menu ────────────────────────────────────────────────────────────
-    help_menu = f"""
-    <div class="uha-menu">
-      <div class="uha-trigger">Help <span class="uha-caret">▾</span></div>
-      <div class="uha-dropdown">
-        {_nav_item("ℹ️", "About",        "javascript:void(0);",  "B")}
-        {_nav_item("🆕", "What's New",   "javascript:void(0);",  "N")}
-        {_nav_item("❓", "Help Center",  "javascript:void(0);",  "H")}
-        {_nav_item("⚠️", "Report Issue", "javascript:void(0);",  "I")}
-      </div>
-    </div>
-    """
+  // Remove old nav + style
+  ['uha-topnav','uha-nav-style'].forEach(function(id) {{
+    var el = doc.getElementById(id);
+    if (el) el.remove();
+  }});
 
-    html = f"""
-    {_NAV_CSS}
-    <div id="uha-topnav">
-      <div class="uha-brand">🏟️&nbsp;<span>UHA IMS</span></div>
-      {file_menu}
-      {dash_menu}
-      {view_menu}
-      {help_menu}
-      <div class="uha-spacer"></div>
-      <div class="uha-ver">v{__version__}</div>
-    </div>
-    """
+  // Inject CSS
+  var style = doc.createElement('style');
+  style.id = 'uha-nav-style';
+  style.textContent = `{css_safe}`;
+  doc.head.appendChild(style);
 
-    st.markdown(html, unsafe_allow_html=True)
+  // Inject nav HTML (only when visible)
+  var navHtml = `{nav_safe}`;
+  if (navHtml.trim() !== '') {{
+    var tmp = doc.createElement('div');
+    tmp.innerHTML = navHtml;
+    var nav = tmp.firstElementChild;
+    if (nav) doc.body.insertBefore(nav, doc.body.firstChild);
+  }}
+}})();
+</script>
+"""
+    components.html(script, height=0, scrolling=False)
 
-# ── end of top nav ───────────────────────────────────────────────────────────
+# ── end of render_top_nav ────────────────────────────────────────────────────
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -428,15 +320,14 @@ def page_dashboard():
     c4.metric("Last Updated", datetime.now().strftime("%m/%d/%Y"))
 
     st.markdown("---")
-
     col1, col2 = st.columns(2)
 
     with col1:
         st.subheader("🔴 Low Stock Items")
         low = db.get_low_stock_items()
         if low:
-            df = pd.DataFrame(low)[["description", "pack_type", "quantity_on_hand",
-                                     "reorder_point", "vendor"]]
+            df = pd.DataFrame(low)[["description", "pack_type",
+                                     "quantity_on_hand", "reorder_point", "vendor"]]
             st.dataframe(df, use_container_width=True, hide_index=True)
         else:
             st.success("All items are stocked above reorder points.")
@@ -471,11 +362,7 @@ def page_inventory():
     with col3:
         show_disc = st.checkbox("Show discontinued")
 
-    if search:
-        items = db.search_items(search)
-    else:
-        items = db.get_all_items("active" if not show_disc else None)
-
+    items = db.search_items(search) if search else db.get_all_items("active" if not show_disc else None)
     if gl_filter:
         items = [i for i in items if (i.get("gl_code") or "").startswith(gl_filter)]
 
@@ -483,11 +370,10 @@ def page_inventory():
         st.info("No items found.")
         return
 
-    df = pd.DataFrame(items)
+    df           = pd.DataFrame(items)
     display_cols = [c for c in [
         "description", "pack_type", "cost", "per", "vendor",
-        "gl_code", "gl_name", "status_tag", "quantity_on_hand",
-        "is_chargeable",
+        "gl_code", "gl_name", "status_tag", "quantity_on_hand", "is_chargeable",
     ] if c in df.columns]
 
     st.caption(f"{len(df)} items")
@@ -495,11 +381,9 @@ def page_inventory():
 
     st.markdown("---")
     st.subheader("✏️ Edit Item")
-
-    keys = [i["key"] for i in items]
+    keys         = [i["key"] for i in items]
     selected_key = st.selectbox("Select item to edit", keys,
                                 format_func=lambda k: k.split("||")[0])
-
     if selected_key:
         item = db.get_item(selected_key)
         if item:
@@ -540,37 +424,34 @@ def _edit_item_form(db, item: dict):
 
     if submitted:
         updates = {
-            "description": desc.strip().upper(),
-            "pack_type":   pack_type.strip().upper(),
-            "cost":        cost,
-            "per":         per,
-            "vendor":      vendor,
-            "item_number": item_number,
-            "gl_code":     gl_code,
-            "gl_name":     gl_name,
-            "yield":       yield_val,
-            "conv_ratio":  conv_ratio,
+            "description":      desc.strip().upper(),
+            "pack_type":        pack_type.strip().upper(),
+            "cost":             cost,
+            "per":              per,
+            "vendor":           vendor,
+            "item_number":      item_number,
+            "gl_code":          gl_code,
+            "gl_name":          gl_name,
+            "yield":            yield_val,
+            "conv_ratio":       conv_ratio,
             "quantity_on_hand": qoh,
-            "user_notes":  notes,
-            "last_updated": datetime.utcnow(),
+            "user_notes":       notes,
+            "last_updated":     datetime.utcnow(),
         }
         if lock_pack:
             updates["override_pack_type"] = pack_type.strip().upper()
         elif not lock_pack and item.get("override_pack_type"):
             updates["override_pack_type"] = None
-
         if lock_yield:
             updates["override_yield"] = yield_val
         elif not lock_yield and item.get("override_yield"):
             updates["override_yield"] = None
-
         if lock_conv:
             updates["override_conv_ratio"] = conv_ratio
         elif not lock_conv and item.get("override_conv_ratio"):
             updates["override_conv_ratio"] = None
 
-        db._apply_update(item["key"], updates,
-                         change_source="manual_edit", changed_by="user")
+        db._apply_update(item["key"], updates, change_source="manual_edit", changed_by="user")
         st.success("✅ Saved!")
         st.rerun()
 
@@ -583,7 +464,7 @@ def _edit_item_form(db, item: dict):
 
 def page_import():
     st.title("📥 Import Files")
-    db      = get_db()
+    db       = get_db()
     importer = get_importer()
 
     tab1, tab2 = st.tabs(["📤 Upload from Computer", "☁️ Import from OneDrive"])
@@ -622,20 +503,20 @@ def page_import():
 
                     if analysis["new_items"]:
                         with st.expander(f"📋 {len(analysis['new_items'])} New Items"):
-                            new_df = pd.DataFrame([
-                                {"Key": i["key"], "Description": i["description"]}
-                                for i in analysis["new_items"]
-                            ])
-                            st.dataframe(new_df, use_container_width=True, hide_index=True)
+                            st.dataframe(
+                                pd.DataFrame([{"Key": i["key"], "Description": i["description"]}
+                                              for i in analysis["new_items"]]),
+                                use_container_width=True, hide_index=True,
+                            )
 
                     if analysis["updates"]:
                         with st.expander(f"🔄 {len(analysis['updates'])} Updates"):
-                            upd_df = pd.DataFrame([
-                                {"Key": i["key"],
-                                 "Fields Changed": ", ".join(i["changes"].keys())}
-                                for i in analysis["updates"]
-                            ])
-                            st.dataframe(upd_df, use_container_width=True, hide_index=True)
+                            st.dataframe(
+                                pd.DataFrame([{"Key": i["key"],
+                                               "Fields Changed": ", ".join(i["changes"].keys())}
+                                              for i in analysis["updates"]]),
+                                use_container_width=True, hide_index=True,
+                            )
 
                     if st.button(f"✅ Confirm Import — {f.name}", key=f"confirm_{f.name}"):
                         results = importer.execute_import(
@@ -682,8 +563,8 @@ def page_import():
                             )
                             os.unlink(tmp_path)
                             st.success(
-                                f"Done: {results.get('new_items_added', 0)} added, "
-                                f"{results.get('items_updated', 0)} updated."
+                                f"Done: {results.get('new_items_added',0)} added, "
+                                f"{results.get('items_updated',0)} updated."
                             )
                             od.archive_file(f["name"], content)
 
@@ -733,8 +614,7 @@ def page_gl_codes():
         st.subheader("GL Code Summary")
         summary = gl.get_gl_summary()
         if summary:
-            sdf = pd.DataFrame(summary)
-            st.dataframe(sdf, use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(summary), use_container_width=True, hide_index=True)
         else:
             st.info("No GL mappings loaded yet.")
 
@@ -747,9 +627,9 @@ def page_gl_codes():
 
 def page_history():
     st.title("📜 Change History")
-    db = get_db()
-
+    db        = get_db()
     key_input = st.text_input("Enter item key or search term")
+
     if key_input:
         history = db.get_item_history(key_input)
         if not history:
@@ -778,28 +658,23 @@ def page_history():
 
 def page_export():
     st.title("📤 Export")
-    db = get_db()
+    db    = get_db()
+    items = db.get_all_items()
 
     st.subheader("Export Full Inventory")
-    items = db.get_all_items()
     if items:
-        df = pd.DataFrame(items)
-
+        df     = pd.DataFrame(items)
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
             df.to_excel(writer, index=False, sheet_name="Inventory")
         buffer.seek(0)
         st.download_button(
-            "⬇️ Download as Excel",
-            data=buffer,
+            "⬇️ Download as Excel", data=buffer,
             file_name=f"inventory_export_{datetime.now().strftime('%Y%m%d')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
-
-        csv = df.to_csv(index=False)
         st.download_button(
-            "⬇️ Download as CSV",
-            data=csv,
+            "⬇️ Download as CSV", data=df.to_csv(index=False),
             file_name=f"inventory_export_{datetime.now().strftime('%Y%m%d')}.csv",
             mime="text/csv",
         )
@@ -843,7 +718,6 @@ def page_app_mgmt():
 # MAIN
 # ────────────────────────────────────────────────────────────────────────────
 
-# Page list used by the sidebar radio (display label → page function)
 _PAGES = {
     "🏠 Dashboard":      page_dashboard,
     "📦 Inventory":      page_inventory,
@@ -856,23 +730,23 @@ _PAGES = {
 }
 
 def main():
-    # ── 1. Session defaults ──────────────────────────────────────────────────
+    # 1. Session defaults
     _init_session()
 
-    # ── 2. URL param handling (page redirect + nav toggle) ───────────────────
+    # 2. URL param routing (toggle_nav / page)
     _handle_query_params()
 
-    # ── 3. Inject fixed top nav bar ──────────────────────────────────────────
+    # 3. Inject top nav into window.parent — must come before sidebar/content
     render_top_nav()
 
-    # ── 4. Sidebar ───────────────────────────────────────────────────────────
+    # 4. Sidebar
     with st.sidebar:
         st.image("https://img.icons8.com/emoji/96/stadium.png", width=48)
         st.markdown("**UHA Inventory**")
         st.caption("TDECU Stadium — Compass Group")
         st.markdown("---")
 
-        # ── Top nav visibility toggle ────────────────────────────────────────
+        # Top nav visibility toggle
         show_nav = st.checkbox(
             "☰  Top Navigation Bar",
             value=st.session_state.show_top_nav,
@@ -883,7 +757,7 @@ def main():
 
         st.markdown("---")
 
-        # ── Page navigation ──────────────────────────────────────────────────
+        # Page navigation
         page_label = st.radio(
             "Navigate",
             list(_PAGES.keys()),
@@ -895,7 +769,7 @@ def main():
 
     onedrive_auth_sidebar()
 
-    # ── 5. Render active page ────────────────────────────────────────────────
+    # 5. Render active page
     _PAGES[st.session_state.current_page]()
 
 
